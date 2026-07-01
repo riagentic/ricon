@@ -64,13 +64,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 // ── tab ──────────────────────────────────────────────────────────────────────
 
-struct Tab {
+struct Shell {
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     pid: Option<u32>,
-    color: Color,
     /// Output activity: bumped by the reader thread, consumed by the UI tick.
     activity: Arc<AtomicU64>,
     seen_activity: u64,
@@ -138,12 +137,11 @@ const AGENTS: &[AgentSpec] = &[
     },
 ];
 
-impl Tab {
+impl Shell {
     fn spawn(
         rows: u16,
         cols: u16,
         cwd: &Path,
-        color: Color,
         pending_cmd: Option<String>,
     ) -> Result<Self, Box<dyn Error>> {
         let pair = native_pty_system().openpty(pty_size(rows, cols))?;
@@ -176,7 +174,6 @@ impl Tab {
             pid: child.process_id(),
             master: pair.master,
             child,
-            color,
             activity,
             seen_activity: 0,
             spawned: Instant::now(),
@@ -311,6 +308,63 @@ impl Tab {
     }
 }
 
+// ── tab: a shell plus its subshells ────────────────────────────────────────────
+
+/// A terminal tab: one parent shell and zero or more subshells, each its own
+/// PTY. The subshells live and move with the tab (they can't be reordered on
+/// their own) and share its color. Exactly one shell is active — shown in the
+/// pane and receiving input; the rest keep running in the background.
+struct Tab {
+    shells: Vec<Shell>,
+    active: usize,
+    color: Color,
+}
+
+impl Tab {
+    /// A new tab: one parent shell in `cwd`, replaying `pending_cmd` if any.
+    fn spawn(
+        rows: u16,
+        cols: u16,
+        cwd: &Path,
+        color: Color,
+        pending_cmd: Option<String>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let parent = Shell::spawn(rows, cols, cwd, pending_cmd)?;
+        Ok(Self { shells: vec![parent], active: 0, color })
+    }
+
+    fn active_shell(&self) -> &Shell {
+        &self.shells[self.active]
+    }
+
+    fn active_shell_mut(&mut self) -> &mut Shell {
+        &mut self.shells[self.active]
+    }
+
+    /// Working directory of the active shell — what new tabs/subshells inherit.
+    fn cwd(&self) -> Option<PathBuf> {
+        self.active_shell().cwd()
+    }
+
+    /// Sidebar height: four rows for the parent, plus two per subshell.
+    fn rows(&self) -> u16 {
+        4 + 2 * (self.shells.len() as u16 - 1)
+    }
+
+    /// Cycle the active shell by `delta` (wrapping); a no-op with no subshells.
+    fn navigate(&mut self, delta: isize) {
+        let n = self.shells.len() as isize;
+        self.active = (self.active as isize + delta).rem_euclid(n) as usize;
+    }
+
+    /// Resize every shell in the tab to the current pane size.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        for shell in &mut self.shells {
+            shell.resize(rows, cols);
+        }
+    }
+}
+
 /// Inner-app terminal modes that change how input must be encoded.
 #[derive(Clone, Copy)]
 struct TermModes {
@@ -333,6 +387,16 @@ struct App {
     dragging_sidebar: bool,
     /// Tab currently being dragged to a new position in the sidebar.
     dragging_tab: Option<usize>,
+    /// First tab visible in the (scrolling) sidebar, captured each render so a
+    /// click maps to the right tab when the list is scrolled past tab 0.
+    list_offset: usize,
+    /// Sidebar height in rows, captured each render — sizes the tab viewport
+    /// for wheel scrolling, overflow detection, and revealing the active tab.
+    sidebar_rows: u16,
+    /// Active tab last revealed into view; lets the active tab scroll into
+    /// view when it changes without yanking the view back during free wheel
+    /// scrolling (which leaves the active tab untouched).
+    shown_active: usize,
     /// Working directory the app was started from; every new shell starts here.
     base: PathBuf,
     /// Last session (folder + command per tab) written to disk; persisted on change.
@@ -363,6 +427,9 @@ impl App {
             sidebar_width: SIDEBAR_WIDTH,
             dragging_sidebar: false,
             dragging_tab: None,
+            list_offset: 0,
+            sidebar_rows: 0,
+            shown_active: 0,
             base,
             saved_session: Vec::new(),
             quit: false,
@@ -390,18 +457,31 @@ impl App {
                 // Graceful exit: stop every shell, then unwind to main() which
                 // restores the host terminal (mouse, paste, keyboard flags).
                 for tab in &mut self.tabs {
-                    let _ = tab.child.kill();
+                    for shell in &mut tab.shells {
+                        let _ = shell.child.kill();
+                    }
                 }
                 return Ok(());
             }
             if self.tabs.is_empty() {
                 return Ok(());
             }
-            let active = self.active;
-            for (i, tab) in self.tabs.iter_mut().enumerate() {
-                tab.tick_activity(i == active);
-                tab.tick_agent();
-                tab.flush_pending();
+            // Reveal the active tab into view only when it just changed — free
+            // wheel scrolling (which never moves `active`) is left untouched.
+            if self.active != self.shown_active {
+                self.reveal_active();
+                self.shown_active = self.active;
+            }
+            let active_tab = self.active;
+            for (ti, tab) in self.tabs.iter_mut().enumerate() {
+                let shown = tab.active;
+                for (si, shell) in tab.shells.iter_mut().enumerate() {
+                    // Only the active tab's active shell is on screen; every
+                    // other shell's output is "unseen" until it is focused.
+                    shell.tick_activity(ti == active_tab && si == shown);
+                    shell.tick_agent();
+                    shell.flush_pending();
+                }
             }
             self.persist_session();
             self.fit_ptys(terminal.size()?.into());
@@ -426,6 +506,9 @@ impl App {
             KeyCode::Char('q') if ctrl => self.quit = true,
             KeyCode::Char('t' | 'n') if ctrl => self.open_tab()?,
             KeyCode::Char('w') if ctrl => self.close_active(),
+            KeyCode::Char('s') if alt => self.open_subshell()?,
+            KeyCode::Up if alt => self.tabs[self.active].navigate(-1),
+            KeyCode::Down if alt => self.tabs[self.active].navigate(1),
             KeyCode::Char(c @ '1'..='9') if alt => {
                 let index = c as usize - '1' as usize;
                 if index < self.tabs.len() {
@@ -437,7 +520,7 @@ impl App {
                 self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
             }
             _ => {
-                let modes = self.tabs[self.active].modes();
+                let modes = self.tabs[self.active].active_shell().modes();
                 if let Some(bytes) = encode_key(&key, modes.app_cursor) {
                     self.write_active(&bytes)?;
                 }
@@ -447,10 +530,80 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
-        if self.tabs[self.active].modes().bracketed_paste {
+        if self.tabs[self.active].active_shell().modes().bracketed_paste {
             self.write_active(format!("\x1b[200~{text}\x1b[201~").as_bytes())
         } else {
             self.write_active(text.as_bytes())
+        }
+    }
+
+    /// Sidebar rows available for tabs (row 0 is the " ricon " title).
+    fn viewport_rows(&self) -> usize {
+        self.sidebar_rows.saturating_sub(1) as usize
+    }
+
+    /// Total rows every tab would occupy — tabs have variable height (four
+    /// rows plus two per subshell), so this is a sum, not a count × 4.
+    fn content_rows(&self) -> usize {
+        self.tabs.iter().map(|t| t.rows() as usize).sum()
+    }
+
+    /// Tab index under sidebar row `row`: walk tab heights from the current
+    /// scroll offset. `None` for the title row (row 0) or rows past the last
+    /// tab. Bounds against `tabs.len()` are the caller's to check.
+    fn tab_at_row(&self, row: u16) -> Option<usize> {
+        let mut r = (row as usize).checked_sub(1)?;
+        for i in self.list_offset..self.tabs.len() {
+            let h = self.tabs[i].rows() as usize;
+            if r < h {
+                return Some(i);
+            }
+            r -= h;
+        }
+        None
+    }
+
+    /// Largest first-visible index that still fills the viewport — the clamp
+    /// for any scroll. Zero when every tab already fits.
+    fn max_offset(&self) -> usize {
+        let vp = self.viewport_rows();
+        let mut used = 0;
+        let mut i = self.tabs.len();
+        while i > 0 && used + self.tabs[i - 1].rows() as usize <= vp {
+            used += self.tabs[i - 1].rows() as usize;
+            i -= 1;
+        }
+        i
+    }
+
+    /// Not every tab fits — i.e. the list is scrollable (drives both the wheel
+    /// and the footer scroll indicator).
+    fn tabs_overflow(&self) -> bool {
+        self.content_rows() > self.viewport_rows()
+    }
+
+    /// Scroll the tab list by `delta` tabs (negative = toward the top),
+    /// clamped to the scrollable range.
+    fn scroll_tabs(&mut self, delta: isize) {
+        self.list_offset = (self.list_offset as isize + delta).clamp(0, self.max_offset() as isize) as usize;
+    }
+
+    /// Bring the active tab into view, scrolling the minimum amount; a no-op
+    /// when it is already visible.
+    fn reveal_active(&mut self) {
+        if self.active < self.list_offset {
+            self.list_offset = self.active;
+            return;
+        }
+        // Scroll down just enough that the active tab's last row is on screen.
+        let vp = self.viewport_rows();
+        while self.list_offset < self.active {
+            let used: usize =
+                self.tabs[self.list_offset..=self.active].iter().map(|t| t.rows() as usize).sum();
+            if used <= vp {
+                break;
+            }
+            self.list_offset += 1;
         }
     }
 
@@ -475,7 +628,7 @@ impl App {
             // Click on a tab entry (row 0 is the title; four rows per tab)
             // selects that terminal and arms it for drag-reordering.
             MouseEventKind::Down(MouseButton::Left) if mouse.column < self.sidebar_width => {
-                if let Some(index) = (mouse.row as usize).checked_sub(1).map(|r| r / 4)
+                if let Some(index) = self.tab_at_row(mouse.row)
                     && index < self.tabs.len()
                 {
                     self.active = index;
@@ -487,7 +640,7 @@ impl App {
             // carrying the active selection with it.
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_tab.is_some() => {
                 let from = self.dragging_tab.unwrap_or(0);
-                if let Some(to) = (mouse.row as usize).checked_sub(1).map(|r| r / 4)
+                if let Some(to) = self.tab_at_row(mouse.row)
                     && from < self.tabs.len()
                     && to < self.tabs.len()
                     && to != from
@@ -503,20 +656,30 @@ impl App {
                 self.dragging_tab = None;
                 return Ok(());
             }
+            // Wheel over the sidebar scrolls the tab list (one tab per notch)
+            // when it overflows the viewport; over the pane it scrolls output.
+            MouseEventKind::ScrollUp if mouse.column < self.sidebar_width => {
+                self.scroll_tabs(-1);
+                return Ok(());
+            }
+            MouseEventKind::ScrollDown if mouse.column < self.sidebar_width => {
+                self.scroll_tabs(1);
+                return Ok(());
+            }
             _ => {}
         }
         if mouse.column >= self.sidebar_width && mouse.row < self.pty_rows {
-            let modes = self.tabs[self.active].modes();
-            // Wheel over the pane scrolls this tab's scrollback — unless the
+            let modes = self.tabs[self.active].active_shell().modes();
+            // Wheel over the pane scrolls this shell's scrollback — unless the
             // inner app grabbed the mouse, in which case it's forwarded.
             if modes.mouse_mode == MouseProtocolMode::None {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
-                        self.tabs[self.active].scroll(SCROLL_STEP as isize);
+                        self.tabs[self.active].active_shell().scroll(SCROLL_STEP as isize);
                         return Ok(());
                     }
                     MouseEventKind::ScrollDown => {
-                        self.tabs[self.active].scroll(-(SCROLL_STEP as isize));
+                        self.tabs[self.active].active_shell().scroll(-(SCROLL_STEP as isize));
                         return Ok(());
                     }
                     _ => {}
@@ -530,12 +693,33 @@ impl App {
         Ok(())
     }
 
-    /// Every new shell starts from the base path with no command to replay.
+    /// Open a new shell right after the active tab, starting in the active
+    /// tab's working directory (falling back to the base path when there is no
+    /// active tab or its cwd can't be read), with no command to replay.
     fn open_tab(&mut self) -> Result<(), Box<dyn Error>> {
-        let base = self.base.clone();
-        self.open_tab_at(&base, None)
+        let cwd = self.tabs.get(self.active).and_then(Tab::cwd).unwrap_or_else(|| self.base.clone());
+        let color = tab_color(self.created);
+        self.created += 1;
+        let tab = Tab::spawn(self.pty_rows, self.pty_cols, &cwd, color, None)?;
+        let at = (self.active + 1).min(self.tabs.len());
+        self.tabs.insert(at, tab);
+        self.active = at;
+        Ok(())
     }
 
+    /// Spawn a subshell in the active tab, in the active shell's directory
+    /// (falling back to the base path), and focus it. The subshell shares the
+    /// tab's color and cannot be reordered independently of the tab.
+    fn open_subshell(&mut self) -> Result<(), Box<dyn Error>> {
+        let (rows, cols, base) = (self.pty_rows, self.pty_cols, self.base.clone());
+        let tab = &mut self.tabs[self.active];
+        let cwd = tab.cwd().unwrap_or(base);
+        tab.shells.push(Shell::spawn(rows, cols, &cwd, None)?);
+        tab.active = tab.shells.len() - 1;
+        Ok(())
+    }
+
+    /// Append a restored shell at the end (restore preserves saved order).
     fn open_tab_at(&mut self, cwd: &Path, cmd: Option<String>) -> Result<(), Box<dyn Error>> {
         let color = tab_color(self.created);
         self.created += 1;
@@ -552,8 +736,9 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, t)| TabState {
-                cwd: t.cwd().unwrap_or_else(|| self.base.clone()),
-                cmd: t.foreground_cmd(),
+                // Persist the parent shell; subshells are session-local.
+                cwd: t.shells[0].cwd().unwrap_or_else(|| self.base.clone()),
+                cmd: t.shells[0].foreground_cmd(),
                 active: i == self.active,
             })
             .collect();
@@ -563,22 +748,35 @@ impl App {
         }
     }
 
+    /// Close the active shell of the active tab; when it was the tab's last
+    /// shell, the tab itself closes on the next reap.
     fn close_active(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            let _ = tab.child.kill();
+            let _ = tab.active_shell_mut().child.kill();
         }
     }
 
+    /// Drop shells whose child has exited, then tabs left with no shell,
+    /// keeping every active index pointed at a surviving neighbour.
     fn reap_dead_tabs(&mut self) {
-        self.tabs.retain_mut(|tab| matches!(tab.child.try_wait(), Ok(None)));
+        for tab in &mut self.tabs {
+            let alive: Vec<bool> =
+                tab.shells.iter_mut().map(|s| matches!(s.child.try_wait(), Ok(None))).collect();
+            let dead_before = alive[..tab.active.min(alive.len())].iter().filter(|a| !**a).count();
+            tab.active = tab.active.saturating_sub(dead_before);
+            let mut keep = alive.iter();
+            tab.shells.retain(|_| *keep.next().unwrap());
+            tab.active = tab.active.min(tab.shells.len().saturating_sub(1));
+        }
+        self.tabs.retain(|t| !t.shells.is_empty());
         self.active = self.active.min(self.tabs.len().saturating_sub(1));
     }
 
     fn write_active(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
-        let tab = &mut self.tabs[self.active];
-        tab.scroll(0); // any input snaps the view back to live output
-        tab.writer.write_all(bytes)?;
-        tab.writer.flush()?;
+        let shell = self.tabs[self.active].active_shell_mut();
+        shell.scroll(0); // any input snaps the view back to live output
+        shell.writer.write_all(bytes)?;
+        shell.writer.flush()?;
         Ok(())
     }
 
@@ -603,7 +801,7 @@ impl App {
 
 // ── ui ───────────────────────────────────────────────────────────────────────
 
-fn draw(frame: &mut Frame, app: &App) {
+fn draw(frame: &mut Frame, app: &mut App) {
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
     let [sidebar, pane] =
         Layout::horizontal([Constraint::Length(app.sidebar_width), Constraint::Min(1)]).areas(body);
@@ -612,35 +810,48 @@ fn draw(frame: &mut Frame, app: &App) {
         app.tabs.iter().enumerate().map(|(i, tab)| tab_item(i, tab, i == app.active, app.sidebar_width));
     let tab_list = List::new(items)
         .block(Block::new().borders(Borders::RIGHT).title(Line::from(" ricon ").bold().centered()));
-    // Stateful render keeps the active tab in view: when the tab list is taller
-    // than the sidebar, ratatui scrolls the offset to the selected (active) tab.
-    let mut state = ListState::default().with_selected(Some(app.active));
+    // `list_offset` is the authoritative scroll position: the wheel moves it and
+    // a changed active tab is revealed into it (see `reveal_active`), so the
+    // render only honours it — no `with_selected`, which would yank the view
+    // back to the active tab and fight free scrolling. Clamp first as the tab
+    // count or sidebar height may have shrunk since the last scroll.
+    app.sidebar_rows = sidebar.height;
+    app.list_offset = app.list_offset.min(app.max_offset());
+    let mut state = ListState::default().with_offset(app.list_offset);
     frame.render_stateful_widget(tab_list, sidebar, &mut state);
+    app.list_offset = state.offset();
 
     if let Some(tab) = app.tabs.get(app.active) {
-        let parser = tab.parser.lock().unwrap_or_else(PoisonError::into_inner);
+        let shell = tab.active_shell();
+        let parser = shell.parser.lock().unwrap_or_else(PoisonError::into_inner);
         frame.render_widget(PseudoTerminal::new(parser.screen()), pane);
-        frame.render_widget(status_bar(app.active, tab, footer.width), footer);
+        frame.render_widget(
+            status_bar(app.active, app.tabs.len(), shell, tab.color, footer.width, app.tabs_overflow()),
+            footer,
+        );
     }
 }
 
-/// Footer: active terminal number, its location and git branch on the left,
-/// the app version pinned to the right corner.
-fn status_bar(index: usize, tab: &Tab, width: u16) -> Line<'static> {
-    let cwd = tab.cwd();
+/// Footer: an up-down arrow when the tab list overflows, then the active
+/// terminal number / tab count, its location and git branch on the left, the
+/// app version pinned to the right corner.
+fn status_bar(index: usize, count: usize, shell: &Shell, color: Color, width: u16, tabs_overflow: bool) -> Line<'static> {
+    let cwd = shell.cwd();
     let path = cwd.as_deref().map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
     let branch = cwd.as_deref().and_then(git_branch).map_or_else(String::new, |b| format!("  ⎇ {b}"));
-    let agent = tab.agent.as_ref().map_or_else(String::new, |a| format!("  ✳ {}", a.model));
+    let agent = shell.agent.as_ref().map_or_else(String::new, |a| format!("  ✳ {}", a.model));
     let right = format!("v{} ", env!("CARGO_PKG_VERSION"));
+    // Scroll indicator sits before the active tab index when not all tabs fit.
+    let scroll = if tabs_overflow { "↕ " } else { "" };
     // Left segment, truncated so the right-corner version always fits.
-    let mut left = format!(" {} ▸ {path}{branch}{agent}", index + 1);
+    let mut left = format!(" {scroll}{}/{count} ▸ {path}{branch}{agent}", index + 1);
     let room = (width as usize).saturating_sub(right.chars().count());
     if left.chars().count() > room {
         left = left.chars().take(room).collect();
     }
     let pad = (width as usize).saturating_sub(left.chars().count() + right.chars().count());
     Line::from(format!("{left}{}{right}", " ".repeat(pad)))
-        .style(Style::new().bg(tab.color).fg(Color::White).bold())
+        .style(Style::new().bg(color).fg(Color::White).bold())
 }
 
 /// First known agent process descending from `shell_pid`, with its spec.
@@ -804,37 +1015,53 @@ fn git_branch(dir: &Path) -> Option<String> {
     })
 }
 
-/// Four-row tab entry: folder name (with unseen-output `*`), full location
-/// path, running process with the activity spinner appended while output is
-/// streaming (+1 s after it settles), and an empty fourth row.
+/// Tab entry. The parent shell takes four rows: folder name (with unseen-output
+/// `*`), full location path, running process with the activity spinner appended
+/// while output is streaming (+1 s after it settles), and an empty fourth row.
+/// Each subshell then adds two rows — its path and running process — shown bold
+/// while it is the tab's active shell.
 fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'static> {
-    // Braille spinner at 0.5 rps: one rotation per 2 s (10 frames × 200 ms).
-    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let cwd = tab.cwd();
+    let style = Style::new().bg(tab.color).fg(Color::White);
+    let spin_style = Style::new().bg(tab.color).fg(SPINNER_COLOR).bold();
+    let parent = &tab.shells[0];
+    let cwd = parent.cwd();
     let marker = if is_active { "▶" } else { " " };
-    let star = if tab.unseen_output { " *" } else { "" };
+    // Any shell producing output while off screen flags the whole tab.
+    let star = if tab.shells.iter().any(|s| s.unseen_output) { " *" } else { "" };
     let folder = cwd.as_deref().map_or_else(|| "?".into(), folder_name);
     let name = format!("{marker}{} {}{star}", index + 1, truncate_tail(&folder, width, 4));
     let full = cwd.as_deref().map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
     let path = format!("   {}", truncate_tail(&full, width, 4));
-    let process = format!("   └ {}", tab.running_process());
-    let frame = (tab.spawned.elapsed().as_millis() / 200) as usize % FRAMES.len();
-    let style = Style::new().bg(tab.color).fg(Color::White);
     let top = if is_active { style.bold() } else { style };
-    let spin_style = Style::new().bg(tab.color).fg(SPINNER_COLOR).bold();
-    // Row 3: process name with the activity spinner appended after it while
-    // output is streaming (+1 s settle). Row 4 is intentionally empty.
-    let mut third = vec![Span::styled(process, style)];
-    if tab.animating {
-        third.push(Span::styled(format!("  {}", FRAMES[frame]), spin_style));
-    }
-    ListItem::new(vec![
+    // Rows 1–4 for the parent: name, path, process (+ spinner), empty row.
+    let mut lines = vec![
         Line::styled(name, top),
         Line::styled(path, style),
-        Line::from(third),
+        Line::from(process_row(parent, style, spin_style)),
         Line::styled(String::new(), style),
-    ])
-    .style(style)
+    ];
+    // Two rows per subshell — path and process — bold while it is active.
+    for (si, sub) in tab.shells.iter().enumerate().skip(1) {
+        let s = if tab.active == si { style.bold() } else { style };
+        let scwd = sub.cwd();
+        let sfull = scwd.as_deref().map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
+        lines.push(Line::styled(format!("   {}", truncate_tail(&sfull, width, 4)), s));
+        lines.push(Line::from(process_row(sub, s, spin_style)));
+    }
+    ListItem::new(lines).style(style)
+}
+
+/// A `└ process` row for one shell, with the braille activity spinner appended
+/// while its output is streaming (+1 s after it settles).
+fn process_row(shell: &Shell, style: Style, spin_style: Style) -> Vec<Span<'static>> {
+    // Braille spinner at 0.5 rps: one rotation per 2 s (10 frames × 200 ms).
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let mut row = vec![Span::styled(format!("   └ {}", shell.running_process()), style)];
+    if shell.animating {
+        let frame = (shell.spawned.elapsed().as_millis() / 200) as usize % FRAMES.len();
+        row.push(Span::styled(format!("  {}", FRAMES[frame]), spin_style));
+    }
+    row
 }
 
 /// Final path component (the current folder); root-style paths show as-is.

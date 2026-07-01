@@ -1,3 +1,2 @@
-# Ricon goals
-
+# Goals
 - Ricon aims to be the best console with vertical tabs
