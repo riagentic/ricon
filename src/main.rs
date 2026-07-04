@@ -82,9 +82,13 @@ struct Shell {
     unseen_output: bool,
     /// AI coding agent detected in this tab's shell, sampled periodically.
     agent: Option<AgentInfo>,
-    /// Last time agent detection ran — throttles the /proc scan whether or not
-    /// an agent was found (a missing agent must not re-scan every frame).
-    agent_sampled: Instant,
+    /// Last /proc sample — throttles cwd/process/agent reads whether or not
+    /// they resolve (the render loop must never touch /proc every frame).
+    sampled: Instant,
+    /// Cached working directory, refreshed by `tick_proc`.
+    cwd: Option<PathBuf>,
+    /// Cached foreground process name, refreshed by `tick_proc`.
+    process: String,
     /// Restored command to replay once the shell's first prompt is up.
     pending_cmd: Option<String>,
 }
@@ -138,12 +142,7 @@ const AGENTS: &[AgentSpec] = &[
 ];
 
 impl Shell {
-    fn spawn(
-        rows: u16,
-        cols: u16,
-        cwd: &Path,
-        pending_cmd: Option<String>,
-    ) -> Result<Self, Box<dyn Error>> {
+    fn spawn(rows: u16, cols: u16, cwd: &Path, pending_cmd: Option<String>) -> Result<Self, Box<dyn Error>> {
         let pair = native_pty_system().openpty(pty_size(rows, cols))?;
 
         let mut cmd = CommandBuilder::new(default_shell());
@@ -168,7 +167,7 @@ impl Shell {
             }
         });
 
-        Ok(Self {
+        let mut shell = Self {
             parser,
             writer: pair.master.take_writer()?,
             pid: child.process_id(),
@@ -182,9 +181,13 @@ impl Shell {
             animating: false,
             unseen_output: false,
             agent: None,
-            agent_sampled: Instant::now(),
+            sampled: Instant::now(),
+            cwd: Some(cwd.to_path_buf()),
+            process: String::new(),
             pending_cmd,
-        })
+        };
+        shell.sample_proc();
+        Ok(shell)
     }
 
     /// Replay a restored command once the shell has produced its first prompt
@@ -214,19 +217,30 @@ impl Shell {
         (!cmd.is_empty()).then_some(cmd)
     }
 
-    /// Detect a known AI coding agent (Claude Code, opencode) in this tab's
-    /// shell and resolve its model name. Sampled at 2 Hz, re-resolved every
-    /// sample so a model change via `/model` (which rewrites the settings file)
-    /// shows up live; the process environment is only a fallback since it is
-    /// frozen at exec time.
-    fn tick_agent(&mut self) {
+    /// Refresh the cached /proc-derived facts the UI renders every frame:
+    /// working directory and foreground process name. A failed cwd read keeps
+    /// the last known directory (e.g. a shell mid-exit).
+    fn sample_proc(&mut self) {
+        if let Some(cwd) = self.read_cwd() {
+            self.cwd = Some(cwd);
+        }
+        self.process = self.read_process();
+    }
+
+    /// Sample everything /proc-derived at 2 Hz: cwd, foreground process name,
+    /// and the AI coding agent (Claude Code, opencode) with its model name.
+    /// The agent model is re-resolved every sample so a change via `/model`
+    /// (which rewrites the settings file) shows up live; the process
+    /// environment is only a fallback since it is frozen at exec time.
+    fn tick_proc(&mut self) {
         const SAMPLE_EVERY: Duration = Duration::from_millis(500);
         // Throttle whether or not an agent is present: detection scans /proc,
         // which is far too costly to repeat every frame (e.g. during a resize).
-        if self.agent_sampled.elapsed() < SAMPLE_EVERY {
+        if self.sampled.elapsed() < SAMPLE_EVERY {
             return;
         }
-        self.agent_sampled = Instant::now();
+        self.sampled = Instant::now();
+        self.sample_proc();
         let Some(shell) = self.pid else {
             self.agent = None;
             return;
@@ -273,14 +287,15 @@ impl Shell {
         self.resized = Instant::now();
     }
 
-    /// Current working directory of the shell, read live from /proc.
-    fn cwd(&self) -> Option<PathBuf> {
+    /// Current working directory of the shell, read live from /proc; the UI
+    /// uses the `cwd` cache instead, refreshed at 2 Hz by `tick_proc`.
+    fn read_cwd(&self) -> Option<PathBuf> {
         std::fs::read_link(format!("/proc/{}/cwd", self.pid?)).ok()
     }
 
-    /// Name of the process currently running in this terminal: the foreground
-    /// process group of the PTY, falling back to the shell itself.
-    fn running_process(&self) -> String {
+    /// Name of the process currently running in this terminal, read live: the
+    /// foreground process group of the PTY, falling back to the shell itself.
+    fn read_process(&self) -> String {
         let Some(pid) = self.pid else { return "?".into() };
         let fg = foreground_pid(pid).unwrap_or(pid);
         proc_comm(fg).or_else(|| proc_comm(pid)).unwrap_or_else(|| "?".into())
@@ -318,6 +333,8 @@ struct Tab {
     shells: Vec<Shell>,
     active: usize,
     color: Color,
+    /// Marked with Alt+F; favorites cluster at the top of the sidebar.
+    favorite: bool,
 }
 
 impl Tab {
@@ -330,7 +347,7 @@ impl Tab {
         pending_cmd: Option<String>,
     ) -> Result<Self, Box<dyn Error>> {
         let parent = Shell::spawn(rows, cols, cwd, pending_cmd)?;
-        Ok(Self { shells: vec![parent], active: 0, color })
+        Ok(Self { shells: vec![parent], active: 0, color, favorite: false })
     }
 
     fn active_shell(&self) -> &Shell {
@@ -342,8 +359,9 @@ impl Tab {
     }
 
     /// Working directory of the active shell — what new tabs/subshells inherit.
+    /// Read live: user-triggered and rare, so exactness beats the cache.
     fn cwd(&self) -> Option<PathBuf> {
-        self.active_shell().cwd()
+        self.active_shell().read_cwd()
     }
 
     /// Sidebar height: four rows for the parent, plus two per subshell.
@@ -401,17 +419,34 @@ struct App {
     base: PathBuf,
     /// Last session (folder + command per tab) written to disk; persisted on change.
     saved_session: Vec<TabState>,
+    /// Last persistence attempt — building the session state does live /proc
+    /// reads per shell, so it runs at 1 Hz, not every frame.
+    persisted: Instant,
+    /// Cached git branch (with the cwd it was read for), refreshed at 2 Hz —
+    /// keeps `.git/HEAD` IO out of the per-frame render path.
+    branch: Option<String>,
+    branch_cwd: Option<PathBuf>,
+    branch_sampled: Instant,
     /// Set by Ctrl+q; the loop then shuts every shell down and exits.
     quit: bool,
 }
 
-/// One persisted tab: its folder, the command running in it (if any), and
-/// whether it was the active tab at save time.
+/// One persisted shell: its folder and the command running in it (if any).
 #[derive(Clone, PartialEq)]
-struct TabState {
+struct ShellState {
     cwd: PathBuf,
     cmd: Option<String>,
+}
+
+/// One persisted tab: its shells (parent first, then subshells in order),
+/// which shell was active, whether it was the active tab at save time, and
+/// whether it was marked as a favorite.
+#[derive(Clone, PartialEq)]
+struct TabState {
+    shells: Vec<ShellState>,
+    active_shell: usize,
     active: bool,
+    favorite: bool,
 }
 
 impl App {
@@ -432,18 +467,30 @@ impl App {
             shown_active: 0,
             base,
             saved_session: Vec::new(),
+            persisted: Instant::now(),
+            branch: None,
+            branch_cwd: None,
+            branch_sampled: Instant::now(),
             quit: false,
         };
         // Restore the persisted tabs at their saved folders, replaying each
         // tab's recorded command; fall back to a single base-path shell when
         // there is no (still-valid) session.
-        let restored: Vec<TabState> = load_session().into_iter().filter(|s| s.cwd.is_dir()).collect();
+        // Drop shells whose folder no longer exists; a tab left with none is
+        // dropped entirely.
+        let restored: Vec<TabState> = load_session()
+            .into_iter()
+            .filter_map(|mut t| {
+                t.shells.retain(|s| s.cwd.is_dir());
+                (!t.shells.is_empty()).then_some(t)
+            })
+            .collect();
         if restored.is_empty() {
             app.open_tab()?;
         } else {
             let active = restored.iter().position(|s| s.active).unwrap_or(0);
             for state in &restored {
-                app.open_tab_at(&state.cwd, state.cmd.clone())?;
+                app.restore_tab(state)?;
             }
             app.active = active.min(app.tabs.len().saturating_sub(1));
         }
@@ -454,8 +501,11 @@ impl App {
         loop {
             self.reap_dead_tabs();
             if self.quit {
-                // Graceful exit: stop every shell, then unwind to main() which
-                // restores the host terminal (mouse, paste, keyboard flags).
+                // Graceful exit: persist the final state (the 1 Hz throttle
+                // may be up to a second behind), stop every shell, then unwind
+                // to main() which restores the host terminal (mouse, paste,
+                // keyboard flags).
+                self.persist_now();
                 for tab in &mut self.tabs {
                     for shell in &mut tab.shells {
                         let _ = shell.child.kill();
@@ -479,7 +529,7 @@ impl App {
                     // Only the active tab's active shell is on screen; every
                     // other shell's output is "unseen" until it is focused.
                     shell.tick_activity(ti == active_tab && si == shown);
-                    shell.tick_agent();
+                    shell.tick_proc();
                     shell.flush_pending();
                 }
             }
@@ -509,6 +559,7 @@ impl App {
             KeyCode::Char('s') if alt => self.open_subshell()?,
             KeyCode::Up if alt => self.tabs[self.active].navigate(-1),
             KeyCode::Down if alt => self.tabs[self.active].navigate(1),
+            KeyCode::Char('f' | 'F') if alt => self.toggle_favorite(),
             KeyCode::Char(c @ '1'..='9') if alt => {
                 let index = c as usize - '1' as usize;
                 if index < self.tabs.len() {
@@ -557,6 +608,24 @@ impl App {
             let h = self.tabs[i].rows() as usize;
             if r < h {
                 return Some(i);
+            }
+            r -= h;
+        }
+        None
+    }
+
+    /// Tab and shell index under sidebar row `row`: like `tab_at_row`, but also
+    /// resolves which shell within the tab was hit — the parent owns rows 0–2
+    /// (name, path, process), then each subshell owns two rows; the blank
+    /// separator maps to the parent. `None` for the title row or empty rows.
+    fn shell_at_row(&self, row: u16) -> Option<(usize, usize)> {
+        let mut r = (row as usize).checked_sub(1)?;
+        for i in self.list_offset..self.tabs.len() {
+            let tab = &self.tabs[i];
+            let h = tab.rows() as usize;
+            if r < h {
+                let shell = if r < 3 || r + 1 == h { 0 } else { 1 + (r - 3) / 2 };
+                return Some((i, shell.min(tab.shells.len() - 1)));
             }
             r -= h;
         }
@@ -625,13 +694,14 @@ impl App {
                 self.dragging_sidebar = false;
                 return Ok(());
             }
-            // Click on a tab entry (row 0 is the title; four rows per tab)
-            // selects that terminal and arms it for drag-reordering.
+            // Click on a tab entry selects that terminal and the specific shell
+            // whose row was hit, and arms the tab for drag-reordering.
             MouseEventKind::Down(MouseButton::Left) if mouse.column < self.sidebar_width => {
-                if let Some(index) = self.tab_at_row(mouse.row)
+                if let Some((index, shell)) = self.shell_at_row(mouse.row)
                     && index < self.tabs.len()
                 {
                     self.active = index;
+                    self.tabs[index].active = shell;
                     self.dragging_tab = Some(index);
                 }
                 return Ok(());
@@ -701,7 +771,11 @@ impl App {
         let color = tab_color(self.created);
         self.created += 1;
         let tab = Tab::spawn(self.pty_rows, self.pty_cols, &cwd, color, None)?;
-        let at = (self.active + 1).min(self.tabs.len());
+        // Right after the active tab, but never inside the favorites block: a
+        // new (non-favorite) tab lands after the last favorite, whichever comes
+        // later, keeping favorites contiguous at the top.
+        let after_favorites = self.tabs.iter().take_while(|t| t.favorite).count();
+        let at = (self.active + 1).max(after_favorites).min(self.tabs.len());
         self.tabs.insert(at, tab);
         self.active = at;
         Ok(())
@@ -719,27 +793,72 @@ impl App {
         Ok(())
     }
 
-    /// Append a restored shell at the end (restore preserves saved order).
-    fn open_tab_at(&mut self, cwd: &Path, cmd: Option<String>) -> Result<(), Box<dyn Error>> {
+    /// Toggle the active tab's favorite flag and re-cluster it: favorites form
+    /// a contiguous block at the top of the sidebar in marking order, so a
+    /// newly-marked tab lands right after the last favorite and an unmarked one
+    /// drops just below that block. The active selection follows the tab.
+    fn toggle_favorite(&mut self) {
+        if self.active >= self.tabs.len() {
+            return;
+        }
+        let mut tab = self.tabs.remove(self.active);
+        tab.favorite = !tab.favorite;
+        let dest = self.tabs.iter().take_while(|t| t.favorite).count();
+        self.tabs.insert(dest, tab);
+        self.active = dest;
+    }
+
+    /// Append a restored tab at the end (restore preserves saved order): spawn
+    /// the parent shell, then each persisted subshell, and select the shell
+    /// that was active at save time. `state.shells` is guaranteed non-empty.
+    fn restore_tab(&mut self, state: &TabState) -> Result<(), Box<dyn Error>> {
         let color = tab_color(self.created);
         self.created += 1;
-        self.tabs.push(Tab::spawn(self.pty_rows, self.pty_cols, cwd, color, cmd)?);
+        let (rows, cols) = (self.pty_rows, self.pty_cols);
+        let mut shells = state.shells.iter();
+        let parent = shells.next().expect("restored tab has at least one shell");
+        let mut tab = Tab::spawn(rows, cols, &parent.cwd, color, parent.cmd.clone())?;
+        for sub in shells {
+            tab.shells.push(Shell::spawn(rows, cols, &sub.cwd, sub.cmd.clone())?);
+        }
+        tab.active = state.active_shell.min(tab.shells.len() - 1);
+        tab.favorite = state.favorite;
+        self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         Ok(())
     }
 
     /// Persist every open tab's folder and running command so the session
-    /// reopens as-is. Writes only on change; reached only with tabs open.
+    /// reopens as-is. Building the state reads /proc live per shell, so it
+    /// runs at 1 Hz (quit forces a final write); reached only with tabs open.
     fn persist_session(&mut self) {
+        const PERSIST_EVERY: Duration = Duration::from_secs(1);
+        if self.persisted.elapsed() < PERSIST_EVERY {
+            return;
+        }
+        self.persisted = Instant::now();
+        self.persist_now();
+    }
+
+    /// Snapshot the session and write it to disk; writes only on change.
+    fn persist_now(&mut self) {
         let states: Vec<TabState> = self
             .tabs
             .iter()
             .enumerate()
             .map(|(i, t)| TabState {
-                // Persist the parent shell; subshells are session-local.
-                cwd: t.shells[0].cwd().unwrap_or_else(|| self.base.clone()),
-                cmd: t.shells[0].foreground_cmd(),
+                // Persist every shell in the tab — parent first, then subshells.
+                shells: t
+                    .shells
+                    .iter()
+                    .map(|s| ShellState {
+                        cwd: s.read_cwd().unwrap_or_else(|| self.base.clone()),
+                        cmd: s.foreground_cmd(),
+                    })
+                    .collect(),
+                active_shell: t.active,
                 active: i == self.active,
+                favorite: t.favorite,
             })
             .collect();
         if states != self.saved_session {
@@ -797,6 +916,19 @@ impl App {
             }
         }
     }
+
+    /// Git branch for `cwd`, cached: re-read when the directory changes or the
+    /// 500 ms sample expires — `.git/HEAD` IO stays out of the render path
+    /// while branch switches still show up promptly.
+    fn git_branch_cached(&mut self, cwd: Option<&Path>) -> Option<String> {
+        const SAMPLE_EVERY: Duration = Duration::from_millis(500);
+        if self.branch_cwd.as_deref() != cwd || self.branch_sampled.elapsed() >= SAMPLE_EVERY {
+            self.branch_sampled = Instant::now();
+            self.branch_cwd = cwd.map(Path::to_path_buf);
+            self.branch = cwd.and_then(git_branch);
+        }
+        self.branch.clone()
+    }
 }
 
 // ── ui ───────────────────────────────────────────────────────────────────────
@@ -821,12 +953,23 @@ fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(tab_list, sidebar, &mut state);
     app.list_offset = state.offset();
 
-    if let Some(tab) = app.tabs.get(app.active) {
+    if app.active < app.tabs.len() {
+        let cwd = app.tabs[app.active].active_shell().cwd.clone();
+        let branch = app.git_branch_cached(cwd.as_deref());
+        let tab = &app.tabs[app.active];
         let shell = tab.active_shell();
         let parser = shell.parser.lock().unwrap_or_else(PoisonError::into_inner);
         frame.render_widget(PseudoTerminal::new(parser.screen()), pane);
         frame.render_widget(
-            status_bar(app.active, app.tabs.len(), shell, tab.color, footer.width, app.tabs_overflow()),
+            status_bar(
+                app.active,
+                app.tabs.len(),
+                shell,
+                branch,
+                tab.color,
+                footer.width,
+                app.tabs_overflow(),
+            ),
             footer,
         );
     }
@@ -835,10 +978,17 @@ fn draw(frame: &mut Frame, app: &mut App) {
 /// Footer: an up-down arrow when the tab list overflows, then the active
 /// terminal number / tab count, its location and git branch on the left, the
 /// app version pinned to the right corner.
-fn status_bar(index: usize, count: usize, shell: &Shell, color: Color, width: u16, tabs_overflow: bool) -> Line<'static> {
-    let cwd = shell.cwd();
-    let path = cwd.as_deref().map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
-    let branch = cwd.as_deref().and_then(git_branch).map_or_else(String::new, |b| format!("  ⎇ {b}"));
+fn status_bar(
+    index: usize,
+    count: usize,
+    shell: &Shell,
+    branch: Option<String>,
+    color: Color,
+    width: u16,
+    tabs_overflow: bool,
+) -> Line<'static> {
+    let path = shell.cwd.as_deref().map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
+    let branch = branch.map_or_else(String::new, |b| format!("  ⎇ {b}"));
     let agent = shell.agent.as_ref().map_or_else(String::new, |a| format!("  ✳ {}", a.model));
     let right = format!("v{} ", env!("CARGO_PKG_VERSION"));
     // Scroll indicator sits before the active tab index when not all tabs fit.
@@ -1024,30 +1174,57 @@ fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'s
     let style = Style::new().bg(tab.color).fg(Color::White);
     let spin_style = Style::new().bg(tab.color).fg(SPINNER_COLOR).bold();
     let parent = &tab.shells[0];
-    let cwd = parent.cwd();
+    let cwd = parent.cwd.as_deref();
     let marker = if is_active { "▶" } else { " " };
     // Any shell producing output while off screen flags the whole tab.
-    let star = if tab.shells.iter().any(|s| s.unseen_output) { " *" } else { "" };
-    let folder = cwd.as_deref().map_or_else(|| "?".into(), folder_name);
-    let name = format!("{marker}{} {}{star}", index + 1, truncate_tail(&folder, width, 4));
-    let full = cwd.as_deref().map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
-    let path = format!("   {}", truncate_tail(&full, width, 4));
+    let unseen = tab.shells.iter().any(|s| s.unseen_output);
+    let folder = cwd.map_or_else(|| "?".into(), folder_name);
+    let full = cwd.map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
+    // A ⭐ sits before the folder name on favorites (a wide glyph, so it steals
+    // three columns from the name's width budget).
+    let pad = if tab.favorite { 7 } else { 4 };
+    let name = format!(" {}", truncate_tail(&folder, width, pad));
+    // The active shell within a multi-shell tab is flagged with ▶ on its path
+    // row, indented two spaces so it nests under the tab-level ▶ (rule: "active
+    // shell shows ▶ … with two prefix spaces"); single-shell tabs rely on the
+    // tab marker alone, so the active-tab ▶ isn't doubled on every tab.
+    let multishell = tab.shells.len() > 1;
+    let shell_mark = |active: bool| if multishell && active { "▶" } else { " " };
+    let path = format!("  {} {}", shell_mark(tab.active == 0), truncate_tail(&full, width, 5));
     let top = if is_active { style.bold() } else { style };
-    // Rows 1–4 for the parent: name, path, process (+ spinner), empty row.
+    let mut first = vec![Span::styled(format!("{marker}{}", index + 1), top)];
+    if tab.favorite {
+        first.push(Span::styled(" ⭐", Style::new().bg(tab.color).fg(Color::Yellow).bold()));
+    }
+    first.push(Span::styled(name, top));
+    // Off-screen output flags the tab with a bold `*` after its name.
+    if unseen {
+        first.push(Span::styled(" *", Style::new().bg(tab.color).fg(Color::White).bold()));
+    }
+    // Parent rows: name, path, process (+ spinner). The blank separator is
+    // pushed last (after any subshells) so it always divides this tab's last
+    // row from the next tab, not the parent from its own subshells.
+    // Parent shell info is bold when the parent is the active shell (multishell
+    // only; single-shell tabs use the tab marker alone, matching `shell_mark`).
+    let parent_style = if multishell && tab.active == 0 { style.bold() } else { style };
     let mut lines = vec![
-        Line::styled(name, top),
-        Line::styled(path, style),
-        Line::from(process_row(parent, style, spin_style)),
-        Line::styled(String::new(), style),
+        Line::from(first),
+        Line::styled(path, parent_style),
+        Line::from(process_row(parent, parent_style, spin_style)),
     ];
     // Two rows per subshell — path and process — bold while it is active.
     for (si, sub) in tab.shells.iter().enumerate().skip(1) {
         let s = if tab.active == si { style.bold() } else { style };
-        let scwd = sub.cwd();
-        let sfull = scwd.as_deref().map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
-        lines.push(Line::styled(format!("   {}", truncate_tail(&sfull, width, 4)), s));
+        let sfull =
+            sub.cwd.as_deref().map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
+        lines.push(Line::styled(
+            format!("  {} {}", shell_mark(tab.active == si), truncate_tail(&sfull, width, 5)),
+            s,
+        ));
         lines.push(Line::from(process_row(sub, s, spin_style)));
     }
+    // Empty last row separating this tab from the next.
+    lines.push(Line::styled(String::new(), style));
     ListItem::new(lines).style(style)
 }
 
@@ -1056,7 +1233,7 @@ fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'s
 fn process_row(shell: &Shell, style: Style, spin_style: Style) -> Vec<Span<'static>> {
     // Braille spinner at 0.5 rps: one rotation per 2 s (10 frames × 200 ms).
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let mut row = vec![Span::styled(format!("   └ {}", shell.running_process()), style)];
+    let mut row = vec![Span::styled(format!("   └ {}", shell.process), style)];
     if shell.animating {
         let frame = (shell.spawned.elapsed().as_millis() / 200) as usize % FRAMES.len();
         row.push(Span::styled(format!("  {}", FRAMES[frame]), spin_style));
@@ -1105,9 +1282,12 @@ fn abbreviate_home(path: &str) -> String {
     }
 }
 
-/// Session file under XDG state home: one tab per line as `[>]folder\tcommand`
-/// — the command is omitted when only the shell ran, and a leading `>` marks
-/// the tab that was active (paths are absolute, so the marker is unambiguous).
+/// Session file under XDG state home: one shell per line as
+/// `[>][!][+][*]folder\tcommand`. A line without `+` starts a new tab (its
+/// parent); `+` lines are that tab's subshells in order. `>` marks the active
+/// tab, `!` a favorite tab (parent line only), `*` the active shell within its
+/// tab, and the command is omitted when only the shell itself ran. Paths are
+/// absolute, so the markers are unambiguous.
 fn session_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -1115,27 +1295,42 @@ fn session_path() -> Option<PathBuf> {
     Some(base.join("ricon").join("session"))
 }
 
-/// Tabs open at last save, in order (folder + replayable command); empty if none.
+/// Tabs open at last save, in order, each with its shells; empty if none.
 fn load_session() -> Vec<TabState> {
-    session_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| {
-            s.lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| {
-                    let (active, rest) = match l.strip_prefix('>') {
-                        Some(r) => (true, r),
-                        None => (false, l),
-                    };
-                    let (cwd, cmd) = match rest.split_once('\t') {
-                        Some((cwd, cmd)) => (cwd, Some(cmd.to_string())),
-                        None => (rest, None),
-                    };
-                    TabState { cwd: cwd.into(), cmd, active }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let text = session_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let mut tabs: Vec<TabState> = Vec::new();
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        // Strip the leading marker chars (order-independent); the path that
+        // follows is absolute, so it never begins with one of them.
+        let (mut active_tab, mut is_sub, mut active_shell, mut favorite) = (false, false, false, false);
+        let mut rest = line;
+        loop {
+            match rest.chars().next() {
+                Some('>') => active_tab = true,
+                Some('+') => is_sub = true,
+                Some('*') => active_shell = true,
+                Some('!') => favorite = true,
+                _ => break,
+            }
+            rest = &rest[1..];
+        }
+        let (cwd, cmd) = match rest.split_once('\t') {
+            Some((cwd, cmd)) => (cwd, Some(cmd.to_string())),
+            None => (rest, None),
+        };
+        let shell = ShellState { cwd: cwd.into(), cmd };
+        match tabs.last_mut() {
+            // A `+` line extends the current tab; anything else starts a new one.
+            Some(tab) if is_sub => {
+                if active_shell {
+                    tab.active_shell = tab.shells.len();
+                }
+                tab.shells.push(shell);
+            }
+            _ => tabs.push(TabState { shells: vec![shell], active_shell: 0, active: active_tab, favorite }),
+        }
+    }
+    tabs
 }
 
 fn save_session(states: &[TabState]) {
@@ -1143,16 +1338,30 @@ fn save_session(states: &[TabState]) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let body: Vec<String> = states
-        .iter()
-        .map(|s| {
-            let mark = if s.active { ">" } else { "" };
-            match &s.cmd {
-                Some(cmd) => format!("{mark}{}\t{cmd}", s.cwd.display()),
-                None => format!("{mark}{}", s.cwd.display()),
+    let mut body: Vec<String> = Vec::new();
+    for tab in states {
+        for (i, shell) in tab.shells.iter().enumerate() {
+            // `>` active tab (parent line only), `+` subshell, `*` active shell.
+            let mut mark = String::new();
+            if i == 0 && tab.active {
+                mark.push('>');
             }
-        })
-        .collect();
+            if i == 0 && tab.favorite {
+                mark.push('!');
+            }
+            if i > 0 {
+                mark.push('+');
+            }
+            if i == tab.active_shell {
+                mark.push('*');
+            }
+            let cwd = shell.cwd.display();
+            body.push(match &shell.cmd {
+                Some(cmd) => format!("{mark}{cwd}\t{cmd}"),
+                None => format!("{mark}{cwd}"),
+            });
+        }
+    }
     let _ = std::fs::write(path, body.join("\n"));
 }
 
