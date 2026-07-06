@@ -1169,20 +1169,24 @@ fn git_branch(dir: &Path) -> Option<String> {
 /// `*`), full location path, running process with the activity spinner appended
 /// while output is streaming (+1 s after it settles), and an empty fourth row.
 /// Each subshell then adds two rows — its path and running process — shown bold
-/// while it is the tab's active shell.
+/// while it is the tab's active shell. Content lines of the active tab carry a
+/// `|` as their first character (the separator row stays empty).
 fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'static> {
     let style = Style::new().bg(tab.color).fg(Color::White);
     let spin_style = Style::new().bg(tab.color).fg(SPINNER_COLOR).bold();
     let parent = &tab.shells[0];
     let cwd = parent.cwd.as_deref();
     let marker = if is_active { "▶" } else { " " };
+    // Every content line of the active tab starts with a `|` gutter column;
+    // inactive tabs get a space so columns stay aligned across the list.
+    let bar = if is_active { "|" } else { " " };
     // Any shell producing output while off screen flags the whole tab.
     let unseen = tab.shells.iter().any(|s| s.unseen_output);
     let folder = cwd.map_or_else(|| "?".into(), folder_name);
     let full = cwd.map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
     // A ⭐ sits before the folder name on favorites (a wide glyph, so it steals
     // three columns from the name's width budget).
-    let pad = if tab.favorite { 7 } else { 4 };
+    let pad = if tab.favorite { 8 } else { 5 };
     let name = format!(" {}", truncate_tail(&folder, width, pad));
     // The active shell within a multi-shell tab is flagged with ▶ on its path
     // row, indented two spaces so it nests under the tab-level ▶ (rule: "active
@@ -1190,9 +1194,9 @@ fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'s
     // tab marker alone, so the active-tab ▶ isn't doubled on every tab.
     let multishell = tab.shells.len() > 1;
     let shell_mark = |active: bool| if multishell && active { "▶" } else { " " };
-    let path = format!("  {} {}", shell_mark(tab.active == 0), truncate_tail(&full, width, 5));
+    let path = format!("{bar}  {} {}", shell_mark(tab.active == 0), truncate_tail(&full, width, 6));
     let top = if is_active { style.bold() } else { style };
-    let mut first = vec![Span::styled(format!("{marker}{}", index + 1), top)];
+    let mut first = vec![Span::styled(format!("{bar}{marker}{}", index + 1), top)];
     if tab.favorite {
         first.push(Span::styled(" ⭐", Style::new().bg(tab.color).fg(Color::Yellow).bold()));
     }
@@ -1210,7 +1214,7 @@ fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'s
     let mut lines = vec![
         Line::from(first),
         Line::styled(path, parent_style),
-        Line::from(process_row(parent, parent_style, spin_style)),
+        Line::from(process_row(parent, bar, parent_style, spin_style)),
     ];
     // Two rows per subshell — path and process — bold while it is active.
     for (si, sub) in tab.shells.iter().enumerate().skip(1) {
@@ -1218,10 +1222,10 @@ fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'s
         let sfull =
             sub.cwd.as_deref().map_or_else(|| "?".into(), |p| abbreviate_home(&p.display().to_string()));
         lines.push(Line::styled(
-            format!("  {} {}", shell_mark(tab.active == si), truncate_tail(&sfull, width, 5)),
+            format!("{bar}  {} {}", shell_mark(tab.active == si), truncate_tail(&sfull, width, 6)),
             s,
         ));
-        lines.push(Line::from(process_row(sub, s, spin_style)));
+        lines.push(Line::from(process_row(sub, bar, s, spin_style)));
     }
     // Empty last row separating this tab from the next.
     lines.push(Line::styled(String::new(), style));
@@ -1229,11 +1233,12 @@ fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'s
 }
 
 /// A `└ process` row for one shell, with the braille activity spinner appended
-/// while its output is streaming (+1 s after it settles).
-fn process_row(shell: &Shell, style: Style, spin_style: Style) -> Vec<Span<'static>> {
+/// while its output is streaming (+1 s after it settles). `bar` is the active-tab
+/// gutter column (`|` when the tab is active, a space otherwise).
+fn process_row(shell: &Shell, bar: &str, style: Style, spin_style: Style) -> Vec<Span<'static>> {
     // Braille spinner at 0.5 rps: one rotation per 2 s (10 frames × 200 ms).
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let mut row = vec![Span::styled(format!("   └ {}", shell.process), style)];
+    let mut row = vec![Span::styled(format!("{bar}   └ {}", shell.process), style)];
     if shell.animating {
         let frame = (shell.spawned.elapsed().as_millis() / 200) as usize % FRAMES.len();
         row.push(Span::styled(format!("  {}", FRAMES[frame]), spin_style));
