@@ -1,6 +1,6 @@
 [package]
 name = "ricon"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A fast terminal console with vertical tabs — per-tab shells, session persistence, and live AI-agent model detection."
@@ -21,3 +21,6 @@ tui-term = "0.3.4"
 
 [profile.release]
 strip = true
+
+[dev-dependencies]
+tempfile = "3"

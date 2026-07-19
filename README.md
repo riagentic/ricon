@@ -13,7 +13,7 @@ A fast terminal console with **vertical tabs** — built with [ratatui](https://
 │ 2 ⭐web *│
 │   ~/code/web
 │   └ vite │
-└──────────┘ 1/2 ▸ ~/code/gen/ricon  ⎇ main  ✳ claude-opus-4-8   v0.2.0
+└──────────┘ 1/2 ▸ ~/code/gen/ricon  ⎇ main  ✳ claude-opus-4-8   v0.3.0
 ```
 
 ## Features
@@ -21,6 +21,8 @@ A fast terminal console with **vertical tabs** — built with [ratatui](https://
 - 🗂️ **Vertical tabs** — entries show folder, full path, running process + activity spinner.
 - 🐚 **Subshells** — `Alt+s` adds extra shells to a tab; they move with it, share its color, and add their own path/process rows.
 - ⭐ **Favorites** — `Alt+f` pins a tab into the favorites block at the top of the sidebar.
+- 🔎 **Search** — a search row above the tabs (focused at start, or `Ctrl+F`) filters tabs by path as you type.
+- ⏵ **Replay** — a red `replay` button beside each process re-runs the shell's last command on click or `Alt+r`.
 - 🎨 **Distinct tab colors** — a cohesive cool-jewel palette, each tab a different hue.
 - 💾 **Session persistence** — reopens tabs, subshells, favorites and the active selection at their folders, replaying the command that was running in each shell.
 - 🌿 **Git-aware status bar** — current path, active branch, and the app version pinned to the right corner.
@@ -61,6 +63,8 @@ ricon ~/code     # base path = given directory; the first shell starts here
 | `Alt+Up` / `Alt+Down` | Previous / next shell within the tab |
 | `Ctrl+w` | Close active shell (its tab closes with the last shell) |
 | `Alt+f` | Toggle favorite (⭐, pinned to the top) |
+| `Ctrl+f` | Focus the search row (filter tabs by path) |
+| `Alt+r` | Replay the shell's last command |
 | `Ctrl+q` | Quit gracefully |
 | `Alt+1` … `Alt+9` | Select tab by number |
 | `Alt+PgDn` / `Alt+PgUp` | Next / previous tab |

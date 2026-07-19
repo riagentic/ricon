@@ -42,7 +42,7 @@
 - fourth row is empty
 
 ## Shell information within the tab
-- shell information of the active shell within the tab are bold
+- in a multi-shell tab, the active shell's information (path, process) is bold (a single-shell tab is distinguished by the tab marker alone)
 
 ## Persistance
 - app persists all open tabs and their folder locations
@@ -67,7 +67,7 @@
 ## Tabs
 - order of tabs can be changed by dragging the tab using mouse
 - new tab is opened right after the active tab or after last favorite tab, whatever comes later
-- new tab working directory is derived from the default location
+- new tab working directory inherits the active tab's working directory (falling back to the base/default location when it can't be read)
 
 ## Shells
 - each tab can hold multiple shells
@@ -76,7 +76,7 @@
 - bshell shares the same color as the parent shell
 - navigation within one shell with shell can be done using Alt+Down or Atl+Up
 - each shell adds two rows to the tab showing path and running process
-- shell text is bold when shell is active
+- shell text is bold when it is the active shell among a tab's multiple shells
 - if tab has multiple hells, ctrl+w only closes active shell
 - subshells are persisted
 
@@ -84,3 +84,11 @@
 - tab can be marked and umarked as favorite using Alt+f
 - when tab is marked as favorite, there is `⭐` added before tab name
 - when tab is marked as favorite it changes position and going on top after last existing favorite tab
+
+## Active tab
+- active tab lines have "│" as the first character (the empty last line included)
+
+
+## Replay button
+- when process is `bash` or any other shell, app captures last command that is typed and confirmed with Enter to save it as a command for replay. Replay perfors typing the same text into console and executing it with Enter
+- next to process name, there is emoji representing `replay` — shown (and clickable / Alt+r) only while the process is a shell; hidden while any other program is in the foreground

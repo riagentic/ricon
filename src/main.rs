@@ -26,7 +26,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState},
+    widgets::{Block, Borders, List, ListItem},
 };
 use tui_term::{
     vt100::{self, MouseProtocolEncoding, MouseProtocolMode},
@@ -40,6 +40,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(30);
 /// Host-side scrollback retained per tab, and lines moved per wheel notch.
 const SCROLLBACK_LINES: usize = 5000;
 const SCROLL_STEP: usize = 3;
+/// Rule: the activity animation lasts one more second after output settles.
+const SETTLE: Duration = Duration::from_secs(1);
+/// Output within this window after a PTY resize is the shell repainting its
+/// prompt on SIGWINCH, not real activity — it must trigger neither the `*`
+/// marker nor the spinner animation.
+const RESIZE_GRACE: Duration = Duration::from_secs(1);
+/// /proc- and disk-derived caches (cwd, process, command line, agent, git
+/// branch) refresh at 2 Hz — the render loop must never do IO every frame.
+const SAMPLE_EVERY: Duration = Duration::from_millis(500);
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = ratatui::init();
@@ -82,13 +91,25 @@ struct Shell {
     unseen_output: bool,
     /// AI coding agent detected in this tab's shell, sampled periodically.
     agent: Option<AgentInfo>,
-    /// Last /proc sample — throttles cwd/process/agent reads whether or not
-    /// they resolve (the render loop must never touch /proc every frame).
-    sampled: Instant,
+    /// Last agent scan — its own throttle: detection walks all of /proc, so
+    /// the app runs it only for the shell whose status bar is on screen.
+    agent_sampled: Instant,
     /// Cached working directory, refreshed by `tick_proc`.
     cwd: Option<PathBuf>,
     /// Cached foreground process name, refreshed by `tick_proc`.
     process: String,
+    /// Cached foreground command line, refreshed by `tick_proc` — what the
+    /// session persists and a restart replays.
+    fg_cmd: Option<String>,
+    /// Last command the user typed and confirmed with Enter at this shell's
+    /// prompt — what the sidebar `replay` button and Alt+r type-and-confirm
+    /// again (kata app.md). Captured from keystrokes + the shell's echo by
+    /// `note_input`, never from /proc, so fast commands and builtins count too.
+    last_cmd: Option<String>,
+    /// Where the command line being typed begins on screen (row, col — the
+    /// prompt's end); `None` between commands. Anchors the echo read that
+    /// `note_input` snapshots into `last_cmd` on Enter.
+    cmd_anchor: Option<(u16, u16)>,
     /// Restored command to replay once the shell's first prompt is up.
     pending_cmd: Option<String>,
 }
@@ -181,9 +202,12 @@ impl Shell {
             animating: false,
             unseen_output: false,
             agent: None,
-            sampled: Instant::now(),
+            agent_sampled: Instant::now(),
             cwd: Some(cwd.to_path_buf()),
             process: String::new(),
+            fg_cmd: None,
+            last_cmd: None,
+            cmd_anchor: None,
             pending_cmd,
         };
         shell.sample_proc();
@@ -196,6 +220,7 @@ impl Shell {
         const STARTUP: Duration = Duration::from_millis(250);
         let ready = self.activity.load(Ordering::Relaxed) > 0 && self.spawned.elapsed() > STARTUP;
         if ready && let Some(cmd) = self.pending_cmd.take() {
+            self.last_cmd = Some(cmd.clone()); // a restored command is replayable at once
             let mut line = cmd.into_bytes();
             line.push(b'\r');
             let _ = self.writer.write_all(&line);
@@ -203,44 +228,109 @@ impl Shell {
         }
     }
 
-    /// Full command line of the process occupying this tab's foreground, when
-    /// something other than the shell is running — what restore replays.
-    fn foreground_cmd(&self) -> Option<String> {
-        let fg = foreground_pid(self.pid?)?;
-        let raw = std::fs::read(format!("/proc/{fg}/cmdline")).ok()?;
-        let cmd = raw
-            .split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(String::from_utf8_lossy)
-            .collect::<Vec<_>>()
-            .join(" ");
-        (!cmd.is_empty()).then_some(cmd)
-    }
-
-    /// Refresh the cached /proc-derived facts the UI renders every frame:
-    /// working directory and foreground process name. A failed cwd read keeps
-    /// the last known directory (e.g. a shell mid-exit).
+    /// Refresh the cached /proc-derived facts the UI renders and the session
+    /// persists: working directory, foreground process name, and its full
+    /// command line — one pass, one foreground lookup. A failed cwd read
+    /// keeps the last known directory (e.g. a shell mid-exit).
     fn sample_proc(&mut self) {
         if let Some(cwd) = self.read_cwd() {
             self.cwd = Some(cwd);
         }
-        self.process = self.read_process();
+        let Some(pid) = self.pid else {
+            self.process = "?".into();
+            self.fg_cmd = None;
+            return;
+        };
+        let fg = foreground_pid(pid);
+        self.process = proc_comm(fg.unwrap_or(pid)).or_else(|| proc_comm(pid)).unwrap_or_else(|| "?".into());
+        self.fg_cmd = fg.and_then(proc_cmdline);
     }
 
-    /// Sample everything /proc-derived at 2 Hz: cwd, foreground process name,
-    /// and the AI coding agent (Claude Code, opencode) with its model name.
-    /// The agent model is re-resolved every sample so a change via `/model`
-    /// (which rewrites the settings file) shows up live; the process
-    /// environment is only a fallback since it is frozen at exec time.
-    fn tick_proc(&mut self) {
-        const SAMPLE_EVERY: Duration = Duration::from_millis(500);
-        // Throttle whether or not an agent is present: detection scans /proc,
-        // which is far too costly to repeat every frame (e.g. during a resize).
-        if self.sampled.elapsed() < SAMPLE_EVERY {
+    /// A replay is offered only while a shell owns the tty (kata app.md §93:
+    /// bash or any other shell, never other programs) and a command has been
+    /// captured to re-run. Gates the sidebar button, its hit-test and Alt+r.
+    fn replayable(&self) -> bool {
+        self.last_cmd.is_some() && is_shell(&self.process)
+    }
+
+    /// Replay the last command observed in this shell: type it and confirm
+    /// with Enter (kata: the red `replay` button / Alt+r). A no-op unless a
+    /// shell is the current foreground process.
+    fn replay(&mut self) {
+        if self.replayable()
+            && let Some(cmd) = self.last_cmd.clone()
+        {
+            self.scroll(0);
+            let mut line = cmd.into_bytes();
+            line.push(b'\r');
+            let _ = self.writer.write_all(&line);
+            let _ = self.writer.flush();
+        }
+    }
+
+    /// Track input the user sends to the shell so `replay` re-runs exactly the
+    /// last command typed and confirmed with Enter (kata app.md §92). ricon
+    /// sits between the keyboard and the PTY, so the command is read straight
+    /// off the shell's own echo — correct for fast commands, builtins,
+    /// pipelines, history recall and tab-completion alike, unlike sampling
+    /// /proc. Called on the live view, before the bytes reach the PTY.
+    fn note_input(&mut self, bytes: &[u8]) {
+        if !self.shell_fg() {
+            self.cmd_anchor = None; // a program owns the tty: keys aren't a command line
+        } else if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+            // Enter confirms the line: snapshot the echoed text prompt→cursor.
+            let end = self.cursor_position();
+            let anchor = self.cmd_anchor.take().unwrap_or(end);
+            let line = self.screen_between(anchor, end);
+            let line = line.trim();
+            if !line.is_empty() {
+                self.last_cmd = Some(line.to_string());
+            }
+        } else if bytes.iter().any(|&b| b == 0x03 || b == 0x07) {
+            self.cmd_anchor = None; // Ctrl+C / Ctrl+G abandon the line → re-anchor next key
+        } else if self.cmd_anchor.is_none() {
+            self.cmd_anchor = Some(self.cursor_position()); // first key: anchor at the prompt end
+        }
+    }
+
+    /// Screen cursor as (row, col) in the visible grid.
+    fn cursor_position(&self) -> (u16, u16) {
+        self.parser.lock().unwrap_or_else(PoisonError::into_inner).screen().cursor_position()
+    }
+
+    /// Echoed screen text between two visible-grid positions (wrapping-aware).
+    fn screen_between(&self, a: (u16, u16), b: (u16, u16)) -> String {
+        self.parser
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .screen()
+            .contents_between(a.0, a.1, b.0, b.1)
+    }
+
+    /// Is the tty foreground a shell at its prompt? True when the shell holds
+    /// its own process group (idle prompt) or the foreground child is itself a
+    /// shell. Read live — per keystroke, human-rate — so it never lags a
+    /// just-finished command the way the 2 Hz `process` cache would.
+    fn shell_fg(&self) -> bool {
+        let Some(pid) = self.pid else { return false };
+        match foreground_pid(pid) {
+            None => true,
+            Some(fg) => proc_comm(fg).is_some_and(|c| is_shell(&c)),
+        }
+    }
+
+    /// Resolve the AI coding agent (Claude Code, opencode) and its model, at
+    /// 2 Hz. Detection scans every /proc entry — O(system processes) — so the
+    /// app runs this only for the shell whose status bar is on screen, never
+    /// per shell (that froze the UI with many tabs). The model is re-resolved
+    /// every sample so a change via `/model` (which rewrites the settings
+    /// file) shows up live; the process environment is only a fallback since
+    /// it is frozen at exec time.
+    fn tick_agent(&mut self) {
+        if self.agent_sampled.elapsed() < SAMPLE_EVERY {
             return;
         }
-        self.sampled = Instant::now();
-        self.sample_proc();
+        self.agent_sampled = Instant::now();
         let Some(shell) = self.pid else {
             self.agent = None;
             return;
@@ -259,12 +349,6 @@ impl Shell {
     /// arrived since the last tick; it stops shortly after output settles.
     /// Output arriving while inactive sets the unseen marker; focus clears it.
     fn tick_activity(&mut self, is_active: bool) {
-        // Rule: the animation lasts one more second after output settles.
-        const SETTLE: Duration = Duration::from_secs(1);
-        // Output within this window after a PTY resize is the shell repainting
-        // its prompt on SIGWINCH, not real activity — it must trigger neither
-        // the `*` marker nor the spinner animation.
-        const RESIZE_GRACE: Duration = Duration::from_secs(1);
         let now = self.activity.load(Ordering::Relaxed);
         if now != self.seen_activity {
             self.seen_activity = now;
@@ -291,14 +375,6 @@ impl Shell {
     /// uses the `cwd` cache instead, refreshed at 2 Hz by `tick_proc`.
     fn read_cwd(&self) -> Option<PathBuf> {
         std::fs::read_link(format!("/proc/{}/cwd", self.pid?)).ok()
-    }
-
-    /// Name of the process currently running in this terminal, read live: the
-    /// foreground process group of the PTY, falling back to the shell itself.
-    fn read_process(&self) -> String {
-        let Some(pid) = self.pid else { return "?".into() };
-        let fg = foreground_pid(pid).unwrap_or(pid);
-        proc_comm(fg).or_else(|| proc_comm(pid)).unwrap_or_else(|| "?".into())
     }
 
     /// Move the host scrollback view by `delta` lines (positive = into older
@@ -369,7 +445,8 @@ impl Tab {
         4 + 2 * (self.shells.len() as u16 - 1)
     }
 
-    /// Cycle the active shell by `delta` (wrapping); a no-op with no subshells.
+    /// Cycle the active *shell within this tab* by `delta` (wrapping, Alt+Up/Down);
+    /// a no-op with no subshells. Switching *tabs* is `App::navigate_tabs`.
     fn navigate(&mut self, delta: isize) {
         let n = self.shells.len() as isize;
         self.active = (self.active as isize + delta).rem_euclid(n) as usize;
@@ -380,6 +457,15 @@ impl Tab {
         for shell in &mut self.shells {
             shell.resize(rows, cols);
         }
+    }
+}
+
+impl Drop for Shell {
+    /// No shell outlives its owner: any path that drops a `Shell` (closing a
+    /// tab, a failed restore, tests) must not leak a live child process. The
+    /// reader thread then sees EOF and exits on its own.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
     }
 }
 
@@ -415,24 +501,44 @@ struct App {
     /// view when it changes without yanking the view back during free wheel
     /// scrolling (which leaves the active tab untouched).
     shown_active: usize,
-    /// Working directory the app was started from; every new shell starts here.
+    /// Working directory the app was started from — the fallback cwd for new
+    /// tabs and subshells when the active shell's directory can't be read
+    /// (new shells otherwise inherit the active tab's cwd).
     base: PathBuf,
     /// Last session (folder + command per tab) written to disk; persisted on change.
     saved_session: Vec<TabState>,
-    /// Last persistence attempt — building the session state does live /proc
-    /// reads per shell, so it runs at 1 Hz, not every frame.
+    /// Last persistence attempt — persisting runs at 1 Hz off the sampling
+    /// caches, not every frame.
     persisted: Instant,
     /// Cached git branch (with the cwd it was read for), refreshed at 2 Hz —
     /// keeps `.git/HEAD` IO out of the per-frame render path.
     branch: Option<String>,
     branch_cwd: Option<PathBuf>,
     branch_sampled: Instant,
+    /// Sidebar search row text: filters the tab list as it is typed.
+    search: String,
+    /// Search row focused: printable keys edit the filter. Focused at app
+    /// start and via Ctrl+F or a click on the row; Esc/Enter or selecting a
+    /// tab returns focus to the shell.
+    search_focus: bool,
+    /// Tab indices passing the search filter, in order — the sidebar renders,
+    /// scrolls and hit-tests exactly this list (`list_offset` indexes into
+    /// it). Refreshed every loop turn and on every filter edit.
+    shown: Vec<usize>,
+    /// Rolling cursor into the flat shell list for staggered /proc sampling.
+    /// Each frame, a few shells (proportional to total shells) are sampled so
+    /// the O(shells) /proc work is spread across the 2-Hz window instead of
+    /// landing on one frame — that burst froze the UI with many tabs.
+    proc_cursor: usize,
+    /// Last shell reaped — reaping runs at 10 Hz, not every frame, since
+    /// `try_wait` per shell is a syscall and O(shells) on the hot path.
+    reaped: Instant,
     /// Set by Ctrl+q; the loop then shuts every shell down and exits.
     quit: bool,
 }
 
 /// One persisted shell: its folder and the command running in it (if any).
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 struct ShellState {
     cwd: PathBuf,
     cmd: Option<String>,
@@ -441,7 +547,7 @@ struct ShellState {
 /// One persisted tab: its shells (parent first, then subshells in order),
 /// which shell was active, whether it was the active tab at save time, and
 /// whether it was marked as a favorite.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 struct TabState {
     shells: Vec<ShellState>,
     active_shell: usize,
@@ -471,6 +577,11 @@ impl App {
             branch: None,
             branch_cwd: None,
             branch_sampled: Instant::now(),
+            search: String::new(),
+            search_focus: true,
+            shown: Vec::new(),
+            proc_cursor: 0,
+            reaped: Instant::now(),
             quit: false,
         };
         // Restore the persisted tabs at their saved folders, replaying each
@@ -494,12 +605,33 @@ impl App {
             }
             app.active = active.min(app.tabs.len().saturating_sub(1));
         }
+        app.refresh_shown();
         Ok(app)
+    }
+
+    /// Rebuild the filtered tab list: indices whose folder path contains the
+    /// search text (case-insensitive); every tab when the search is empty.
+    fn refresh_shown(&mut self) {
+        let needle = self.search.to_lowercase();
+        self.shown = (0..self.tabs.len())
+            .filter(|&i| {
+                needle.is_empty()
+                    || self.tabs[i].shells[0]
+                        .cwd
+                        .as_deref()
+                        .is_some_and(|p| p.display().to_string().to_lowercase().contains(&needle))
+            })
+            .collect();
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), Box<dyn Error>> {
         loop {
-            self.reap_dead_tabs();
+            // Reap at 10 Hz: `try_wait` is a syscall per shell, so the per-frame
+            // O(shells) sweep is throttled off the 30-ms render path.
+            if self.reaped.elapsed() >= Duration::from_millis(100) {
+                self.reaped = Instant::now();
+                self.reap_dead_tabs();
+            }
             if self.quit {
                 // Graceful exit: persist the final state (the 1 Hz throttle
                 // may be up to a second behind), stop every shell, then unwind
@@ -514,8 +646,15 @@ impl App {
                 return Ok(());
             }
             if self.tabs.is_empty() {
+                // The last shell was closed: persist the now-empty session so
+                // the next start opens fresh instead of resurrecting the tab
+                // the user just closed (the 1 Hz snapshot still contains it).
+                self.persist_now();
                 return Ok(());
             }
+            // The filtered tab list drives everything below (reveal, render,
+            // hit-testing); tabs may have been added, closed or reaped.
+            self.refresh_shown();
             // Reveal the active tab into view only when it just changed — free
             // wheel scrolling (which never moves `active`) is left untouched.
             if self.active != self.shown_active {
@@ -529,10 +668,17 @@ impl App {
                     // Only the active tab's active shell is on screen; every
                     // other shell's output is "unseen" until it is focused.
                     shell.tick_activity(ti == active_tab && si == shown);
-                    shell.tick_proc();
                     shell.flush_pending();
                 }
             }
+            // Staggered /proc sampling: a slice of shells each frame so the 3N
+            // /proc reads (cwd, stat, cmdline per shell) spread across the
+            // 2-Hz window instead of one O(shells) burst frame — that burst
+            // froze the UI with many tabs.
+            self.sample_shells();
+            // Only the shell whose status bar is on screen needs its AI agent
+            // resolved — detection is O(system processes) per call.
+            self.tabs[active_tab].active_shell_mut().tick_agent();
             self.persist_session();
             self.fit_ptys(terminal.size()?.into());
             terminal.draw(|frame| draw(frame, self))?;
@@ -556,19 +702,32 @@ impl App {
             KeyCode::Char('q') if ctrl => self.quit = true,
             KeyCode::Char('t' | 'n') if ctrl => self.open_tab()?,
             KeyCode::Char('w') if ctrl => self.close_active(),
+            KeyCode::Char('f') if ctrl => self.search_focus = true,
             KeyCode::Char('s') if alt => self.open_subshell()?,
+            KeyCode::Char('r' | 'R') if alt => self.tabs[self.active].active_shell_mut().replay(),
             KeyCode::Up if alt => self.tabs[self.active].navigate(-1),
             KeyCode::Down if alt => self.tabs[self.active].navigate(1),
             KeyCode::Char('f' | 'F') if alt => self.toggle_favorite(),
+            // Tab-switching stays within the search-filtered list (`shown`):
+            // Alt+N jumps to the Nth visible tab, Alt+PageUp/Down step between
+            // visible tabs — hidden (filtered-out) tabs are skipped.
             KeyCode::Char(c @ '1'..='9') if alt => {
-                let index = c as usize - '1' as usize;
-                if index < self.tabs.len() {
+                if let Some(&index) = self.shown.get(c as usize - '1' as usize) {
                     self.active = index;
                 }
             }
-            KeyCode::PageDown if alt => self.active = (self.active + 1) % self.tabs.len(),
-            KeyCode::PageUp if alt => {
-                self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+            KeyCode::PageDown if alt => self.navigate_tabs(1),
+            KeyCode::PageUp if alt => self.navigate_tabs(-1),
+            // Search row editing while it has focus: printable keys build the
+            // filter, Backspace erases, Esc/Enter hand focus back to the shell.
+            KeyCode::Esc | KeyCode::Enter if self.search_focus => self.search_focus = false,
+            KeyCode::Backspace if self.search_focus => {
+                self.search.pop();
+                self.refresh_shown();
+            }
+            KeyCode::Char(c) if self.search_focus && !ctrl && !alt => {
+                self.search.push(c);
+                self.refresh_shown();
             }
             _ => {
                 let modes = self.tabs[self.active].active_shell().modes();
@@ -580,6 +739,18 @@ impl App {
         Ok(())
     }
 
+    /// Switch the active tab by `delta` visible positions (wrapping) within the
+    /// search-filtered list, so navigation skips filtered-out tabs. A no-op when
+    /// nothing passes the filter.
+    fn navigate_tabs(&mut self, delta: isize) {
+        if self.shown.is_empty() {
+            return;
+        }
+        let pos = self.shown.iter().position(|&i| i == self.active).unwrap_or(0);
+        let next = (pos as isize + delta).rem_euclid(self.shown.len() as isize) as usize;
+        self.active = self.shown[next];
+    }
+
     fn on_paste(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
         if self.tabs[self.active].active_shell().modes().bracketed_paste {
             self.write_active(format!("\x1b[200~{text}\x1b[201~").as_bytes())
@@ -588,58 +759,92 @@ impl App {
         }
     }
 
-    /// Sidebar rows available for tabs (row 0 is the " ricon " title).
+    /// Sidebar rows available for tabs (row 0 is the " ricon " title, row 1
+    /// the search row).
     fn viewport_rows(&self) -> usize {
-        self.sidebar_rows.saturating_sub(1) as usize
+        self.sidebar_rows.saturating_sub(2) as usize
     }
 
-    /// Total rows every tab would occupy — tabs have variable height (four
-    /// rows plus two per subshell), so this is a sum, not a count × 4.
+    /// Total rows every shown tab would occupy — tabs have variable height
+    /// (four rows plus two per subshell), so this is a sum, not a count × 4.
     fn content_rows(&self) -> usize {
-        self.tabs.iter().map(|t| t.rows() as usize).sum()
+        self.shown.iter().map(|&i| self.tabs[i].rows() as usize).sum()
     }
 
-    /// Tab index under sidebar row `row`: walk tab heights from the current
-    /// scroll offset. `None` for the title row (row 0) or rows past the last
-    /// tab. Bounds against `tabs.len()` are the caller's to check.
+    /// Tab index under sidebar row `row`: walk shown-tab heights from the
+    /// current scroll offset. `None` for the title row (0), the search row (1)
+    /// or rows past the last shown tab.
     fn tab_at_row(&self, row: u16) -> Option<usize> {
-        let mut r = (row as usize).checked_sub(1)?;
-        for i in self.list_offset..self.tabs.len() {
-            let h = self.tabs[i].rows() as usize;
-            if r < h {
-                return Some(i);
-            }
-            r -= h;
-        }
-        None
+        self.hit(row).map(|(tab, _, _)| tab)
     }
 
-    /// Tab and shell index under sidebar row `row`: like `tab_at_row`, but also
-    /// resolves which shell within the tab was hit — the parent owns rows 0–2
+    /// Tab and shell index under sidebar row `row` — the parent owns rows 0–2
     /// (name, path, process), then each subshell owns two rows; the blank
-    /// separator maps to the parent. `None` for the title row or empty rows.
+    /// separator maps to the parent.
     fn shell_at_row(&self, row: u16) -> Option<(usize, usize)> {
-        let mut r = (row as usize).checked_sub(1)?;
-        for i in self.list_offset..self.tabs.len() {
+        self.hit(row).map(|(tab, shell, _)| (tab, shell))
+    }
+
+    /// Resolve sidebar row `row` against the shown tabs: the tab, the shell
+    /// whose rows were hit, and whether it was that shell's process row (where
+    /// the `replay` button lives). `None` above the tabs or past the last one.
+    fn hit(&self, row: u16) -> Option<(usize, usize, bool)> {
+        let mut r = (row as usize).checked_sub(2)?;
+        for &i in self.shown.get(self.list_offset..)? {
             let tab = &self.tabs[i];
             let h = tab.rows() as usize;
             if r < h {
                 let shell = if r < 3 || r + 1 == h { 0 } else { 1 + (r - 3) / 2 };
-                return Some((i, shell.min(tab.shells.len() - 1)));
+                let shell = shell.min(tab.shells.len() - 1);
+                // Parent process row is local row 2; subshell `s` owns rows
+                // 2s+1 (path) and 2s+2 (process).
+                let process_row = r + 1 != h && (if shell == 0 { r == 2 } else { r == 2 * shell + 2 });
+                return Some((i, shell, process_row));
             }
             r -= h;
         }
         None
     }
 
-    /// Largest first-visible index that still fills the viewport — the clamp
-    /// for any scroll. Zero when every tab already fits.
+    /// The (tab, shell) whose `replay` button sits under (`row`, `col`): a
+    /// process row, a last command to replay, and the click inside the button
+    /// label right after the process name (kept in sync with `process_row`).
+    fn replay_at(&self, row: u16, col: u16) -> Option<(usize, usize)> {
+        let (tab, shell, process_row) = self.hit(row)?;
+        let s = &self.tabs[tab].shells[shell];
+        if !process_row || !s.replayable() {
+            return None;
+        }
+        // `{bar}   └ {process}` is 6 columns of prefix, then 2 spaces of gap.
+        let start = 6 + s.process.chars().count() + 2;
+        let span = start..start + REPLAY_COLS;
+        span.contains(&(col as usize)).then_some((tab, shell))
+    }
+
+    /// Shown tabs intersecting the sidebar viewport from the current scroll
+    /// offset, as a range of positions into `shown`. The render builds items
+    /// only for these — with many tabs, building every item every frame is
+    /// wasted work (and froze the UI at scale).
+    fn visible_tabs(&self) -> std::ops::Range<usize> {
+        let vp = self.viewport_rows();
+        let start = self.list_offset.min(self.shown.len());
+        let mut used = 0;
+        let mut end = start;
+        while end < self.shown.len() && used < vp {
+            used += self.tabs[self.shown[end]].rows() as usize;
+            end += 1;
+        }
+        start..end
+    }
+
+    /// Largest first-visible position that still fills the viewport — the
+    /// clamp for any scroll. Zero when every shown tab already fits.
     fn max_offset(&self) -> usize {
         let vp = self.viewport_rows();
         let mut used = 0;
-        let mut i = self.tabs.len();
-        while i > 0 && used + self.tabs[i - 1].rows() as usize <= vp {
-            used += self.tabs[i - 1].rows() as usize;
+        let mut i = self.shown.len();
+        while i > 0 && used + self.tabs[self.shown[i - 1]].rows() as usize <= vp {
+            used += self.tabs[self.shown[i - 1]].rows() as usize;
             i -= 1;
         }
         i
@@ -658,17 +863,18 @@ impl App {
     }
 
     /// Bring the active tab into view, scrolling the minimum amount; a no-op
-    /// when it is already visible.
+    /// when it is already visible or filtered out by the search.
     fn reveal_active(&mut self) {
-        if self.active < self.list_offset {
-            self.list_offset = self.active;
+        let Some(pos) = self.shown.iter().position(|&i| i == self.active) else { return };
+        if pos < self.list_offset {
+            self.list_offset = pos;
             return;
         }
         // Scroll down just enough that the active tab's last row is on screen.
         let vp = self.viewport_rows();
-        while self.list_offset < self.active {
+        while self.list_offset < pos {
             let used: usize =
-                self.tabs[self.list_offset..=self.active].iter().map(|t| t.rows() as usize).sum();
+                self.shown[self.list_offset..=pos].iter().map(|&i| self.tabs[i].rows() as usize).sum();
             if used <= vp {
                 break;
             }
@@ -694,15 +900,25 @@ impl App {
                 self.dragging_sidebar = false;
                 return Ok(());
             }
-            // Click on a tab entry selects that terminal and the specific shell
-            // whose row was hit, and arms the tab for drag-reordering.
+            // Clicks inside the sidebar: the `replay` button re-runs that
+            // shell's last command; the search row takes focus; a tab entry
+            // selects that terminal and the specific shell whose row was hit,
+            // and arms the tab for drag-reordering.
             MouseEventKind::Down(MouseButton::Left) if mouse.column < self.sidebar_width => {
-                if let Some((index, shell)) = self.shell_at_row(mouse.row)
+                if let Some((index, shell)) = self.replay_at(mouse.row, mouse.column) {
+                    self.active = index;
+                    self.tabs[index].active = shell;
+                    self.search_focus = false;
+                    self.tabs[index].shells[shell].replay();
+                } else if mouse.row == 1 {
+                    self.search_focus = true;
+                } else if let Some((index, shell)) = self.shell_at_row(mouse.row)
                     && index < self.tabs.len()
                 {
                     self.active = index;
                     self.tabs[index].active = shell;
                     self.dragging_tab = Some(index);
+                    self.search_focus = false;
                 }
                 return Ok(());
             }
@@ -829,8 +1045,8 @@ impl App {
     }
 
     /// Persist every open tab's folder and running command so the session
-    /// reopens as-is. Building the state reads /proc live per shell, so it
-    /// runs at 1 Hz (quit forces a final write); reached only with tabs open.
+    /// reopens as-is, at 1 Hz (quit forces a final write). Building the state
+    /// is IO-free — it snapshots the 2 Hz `tick_proc` caches.
     fn persist_session(&mut self) {
         const PERSIST_EVERY: Duration = Duration::from_secs(1);
         if self.persisted.elapsed() < PERSIST_EVERY {
@@ -852,8 +1068,8 @@ impl App {
                     .shells
                     .iter()
                     .map(|s| ShellState {
-                        cwd: s.read_cwd().unwrap_or_else(|| self.base.clone()),
-                        cmd: s.foreground_cmd(),
+                        cwd: s.cwd.clone().unwrap_or_else(|| self.base.clone()),
+                        cmd: s.fg_cmd.clone(),
                     })
                     .collect(),
                 active_shell: t.active,
@@ -868,11 +1084,47 @@ impl App {
     }
 
     /// Close the active shell of the active tab; when it was the tab's last
-    /// shell, the tab itself closes on the next reap.
+    /// shell, the tab itself closes on the next reap. Reap immediately so the
+    /// close is visible without waiting on the 10-Hz throttle.
     fn close_active(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             let _ = tab.active_shell_mut().child.kill();
         }
+        self.reaped = Instant::now() - Duration::from_secs(1);
+        self.reap_dead_tabs();
+    }
+
+    /// Sample /proc for a slice of shells this frame, rotating through all of
+    /// them over the 2-Hz window: every shell (the active one included) is
+    /// sampled every ~`SAMPLE_EVERY`, but only `ceil(N / frames-per-window)`
+    /// per frame — the 3N /proc reads spread across frames instead of bursting
+    /// in one (that burst froze the UI with many tabs), and no shell is ever
+    /// read every frame.
+    fn sample_shells(&mut self) {
+        let total: usize = self.tabs.iter().map(|t| t.shells.len()).sum();
+        if total == 0 {
+            return;
+        }
+        let frames = (SAMPLE_EVERY.as_millis() / POLL_INTERVAL.as_millis()).max(1) as usize;
+        for _ in 0..total.div_ceil(frames) {
+            let (ti, si) = self.flat_index(self.proc_cursor % total);
+            self.proc_cursor = (self.proc_cursor + 1) % total;
+            if let Some(shell) = self.tabs.get_mut(ti).and_then(|t| t.shells.get_mut(si)) {
+                shell.sample_proc();
+            }
+        }
+    }
+
+    /// Translate a flat shell index (0..total) into (tab, shell) coordinates.
+    fn flat_index(&self, mut n: usize) -> (usize, usize) {
+        for (ti, tab) in self.tabs.iter().enumerate() {
+            let len = tab.shells.len();
+            if n < len {
+                return (ti, n);
+            }
+            n -= len;
+        }
+        (0, 0)
     }
 
     /// Drop shells whose child has exited, then tabs left with no shell,
@@ -894,6 +1146,7 @@ impl App {
     fn write_active(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         let shell = self.tabs[self.active].active_shell_mut();
         shell.scroll(0); // any input snaps the view back to live output
+        shell.note_input(bytes); // capture the typed command for `replay`, off the live view
         shell.writer.write_all(bytes)?;
         shell.writer.flush()?;
         Ok(())
@@ -904,6 +1157,10 @@ impl App {
     /// represent screens that small.
     fn fit_ptys(&mut self, area: Rect) {
         self.term_width = area.width;
+        // Re-clamp a dragged-wide sidebar when the terminal itself shrinks,
+        // so the pane never collapses to nothing.
+        let max = area.width.saturating_sub(MIN_PANE_WIDTH).max(MIN_SIDEBAR_WIDTH);
+        self.sidebar_width = self.sidebar_width.clamp(MIN_SIDEBAR_WIDTH, max);
         if area.height < 3 || area.width <= self.sidebar_width + 1 {
             return;
         }
@@ -921,7 +1178,6 @@ impl App {
     /// 500 ms sample expires — `.git/HEAD` IO stays out of the render path
     /// while branch switches still show up promptly.
     fn git_branch_cached(&mut self, cwd: Option<&Path>) -> Option<String> {
-        const SAMPLE_EVERY: Duration = Duration::from_millis(500);
         if self.branch_cwd.as_deref() != cwd || self.branch_sampled.elapsed() >= SAMPLE_EVERY {
             self.branch_sampled = Instant::now();
             self.branch_cwd = cwd.map(Path::to_path_buf);
@@ -938,20 +1194,29 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let [sidebar, pane] =
         Layout::horizontal([Constraint::Length(app.sidebar_width), Constraint::Min(1)]).areas(body);
 
-    let items =
-        app.tabs.iter().enumerate().map(|(i, tab)| tab_item(i, tab, i == app.active, app.sidebar_width));
-    let tab_list = List::new(items)
-        .block(Block::new().borders(Borders::RIGHT).title(Line::from(" ricon ").bold().centered()));
-    // `list_offset` is the authoritative scroll position: the wheel moves it and
-    // a changed active tab is revealed into it (see `reveal_active`), so the
-    // render only honours it — no `with_selected`, which would yank the view
-    // back to the active tab and fight free scrolling. Clamp first as the tab
-    // count or sidebar height may have shrunk since the last scroll.
+    // Sidebar: the " ricon " title row, then the search row, then the tabs.
+    let block = Block::new().borders(Borders::RIGHT).title(Line::from(" ricon ").bold().centered());
+    let inner = block.inner(sidebar);
+    frame.render_widget(block, sidebar);
+    let [search_area, list_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    // Search row (kata ui.md): filters the tab list as it is typed; a block
+    // caret marks focus (app start, Ctrl+F, or a click on the row).
+    let caret = if app.search_focus { "█" } else { "" };
+    let search_style = if app.search_focus { Style::new().bold() } else { Style::new().fg(Color::DarkGray) };
+    frame.render_widget(Line::styled(format!(" ⌕ {}{caret}", app.search), search_style), search_area);
+    // `list_offset` is the authoritative scroll position: the wheel moves it
+    // and a changed active tab is revealed into it (see `reveal_active`), so
+    // the render only honours it — nothing may yank the view back to the
+    // active tab and fight free scrolling. Clamp first as the tab count,
+    // filter or sidebar height may have shrunk since the last scroll; then
+    // build items for the visible (shown) tabs only.
+    app.refresh_shown();
     app.sidebar_rows = sidebar.height;
     app.list_offset = app.list_offset.min(app.max_offset());
-    let mut state = ListState::default().with_offset(app.list_offset);
-    frame.render_stateful_widget(tab_list, sidebar, &mut state);
-    app.list_offset = state.offset();
+    let visible = app.visible_tabs();
+    let items =
+        app.shown[visible].iter().map(|&i| tab_item(i, &app.tabs[i], i == app.active, app.sidebar_width));
+    frame.render_widget(List::new(items), list_area);
 
     if app.active < app.tabs.len() {
         let cwd = app.tabs[app.active].active_shell().cwd.clone();
@@ -1038,6 +1303,18 @@ fn proc_ppid(pid: u32) -> Option<u32> {
 
 fn proc_comm(pid: u32) -> Option<String> {
     Some(std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?.trim().to_string())
+}
+
+/// Full command line of process `pid`, NUL-separated args joined with spaces.
+fn proc_cmdline(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let cmd = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!cmd.is_empty()).then_some(cmd)
 }
 
 /// Foreground process-group pid of the shell's PTY (tpgid from
@@ -1170,16 +1447,16 @@ fn git_branch(dir: &Path) -> Option<String> {
 /// while output is streaming (+1 s after it settles), and an empty fourth row.
 /// Each subshell then adds two rows — its path and running process — shown bold
 /// while it is the tab's active shell. Content lines of the active tab carry a
-/// `|` as their first character (the separator row stays empty).
+/// `│` as their first character (the empty separator row included).
 fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'static> {
     let style = Style::new().bg(tab.color).fg(Color::White);
     let spin_style = Style::new().bg(tab.color).fg(SPINNER_COLOR).bold();
     let parent = &tab.shells[0];
     let cwd = parent.cwd.as_deref();
     let marker = if is_active { "▶" } else { " " };
-    // Every content line of the active tab starts with a `|` gutter column;
+    // Every content line of the active tab starts with a `│` gutter column;
     // inactive tabs get a space so columns stay aligned across the list.
-    let bar = if is_active { "|" } else { " " };
+    let bar = if is_active { "│" } else { " " };
     // Any shell producing output while off screen flags the whole tab.
     let unseen = tab.shells.iter().any(|s| s.unseen_output);
     let folder = cwd.map_or_else(|| "?".into(), folder_name);
@@ -1227,8 +1504,9 @@ fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'s
         ));
         lines.push(Line::from(process_row(sub, bar, s, spin_style)));
     }
-    // Empty last row separating this tab from the next.
-    lines.push(Line::styled(String::new(), style));
+    // Empty last row separating this tab from the next; on the active tab it
+    // carries the `│` gutter like every other line.
+    lines.push(Line::styled(bar.to_string(), style));
     ListItem::new(lines).style(style)
 }
 
@@ -1239,6 +1517,17 @@ fn process_row(shell: &Shell, bar: &str, style: Style, spin_style: Style) -> Vec
     // Braille spinner at 0.5 rps: one rotation per 2 s (10 frames × 200 ms).
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let mut row = vec![Span::styled(format!("{bar}   └ {}", shell.process), style)];
+    // Kata: a `replay` emoji next to the process name re-runs the shell's
+    // last command (mouse click or Alt+r) — only while a shell is the
+    // foreground process, never next to another program. It sits before the
+    // spinner so its click target never shifts as the spinner comes and goes;
+    // its column span must stay in sync with `App::replay_at`.
+    if shell.replayable() {
+        row.push(Span::styled(
+            format!("  {REPLAY_LABEL}"),
+            style.patch(Style::new().fg(REPLAY_COLOR)).bold(),
+        ));
+    }
     if shell.animating {
         let frame = (shell.spawned.elapsed().as_millis() / 200) as usize % FRAMES.len();
         row.push(Span::styled(format!("  {}", FRAMES[frame]), spin_style));
@@ -1378,6 +1667,18 @@ fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
 }
 
+/// Shells whose typed command lines `replay` captures (kata app.md §93: "bash
+/// or any other shell").
+const SHELLS: &[&str] =
+    &["sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "ash", "nu", "elvish", "xonsh"];
+
+/// Is `comm` (a /proc process name, possibly a login shell's leading `-`) a
+/// shell whose prompt input `replay` should track?
+fn is_shell(comm: &str) -> bool {
+    let name = comm.rsplit('/').next().unwrap_or(comm);
+    SHELLS.contains(&name.strip_prefix('-').unwrap_or(name))
+}
+
 /// Distinct, cool-biased tab background for the n-th created tab: a curated
 /// ring of modern jewel hues (azure → violet → teal → indigo, no warm
 /// reds/oranges/yellows) sharing one saturation/lightness so the palette reads
@@ -1391,6 +1692,16 @@ fn tab_color(n: usize) -> Color {
 
 /// The activity spinner's single color, per the kata: white.
 const SPINNER_COLOR: Color = Color::Rgb(255, 255, 255);
+
+/// The `replay` button's color, per the kata: red (bright enough to stay
+/// legible on the dark tab backgrounds).
+const REPLAY_COLOR: Color = Color::Rgb(255, 92, 92);
+
+/// The `replay` button glyph, per the kata: an emoji representing replay.
+const REPLAY_LABEL: &str = "🔁";
+/// Terminal columns the replay emoji occupies — its clickable width (the emoji
+/// renders two cells wide, so a one-char span would miss its right half).
+const REPLAY_COLS: usize = 2;
 
 fn hsl_rgb(h: f32, s: f32, l: f32) -> Color {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
@@ -1496,8 +1807,13 @@ fn encode_mouse(mouse: &MouseEvent, col: u16, row: u16, modes: &TermModes) -> Op
         // Legacy (and utf8) encoding: release loses the button identity.
         _ => {
             let cb = if press { cb } else { 3 };
-            let clamp = |v: u16| 32 + (v + 1).min(222) as u8;
+            // Coordinate byte is 32 + 1-based position, capped at 255 — the
+            // largest position legacy encoding can express is 223.
+            let clamp = |v: u16| 32 + (v + 1).min(223) as u8;
             vec![0x1b, b'[', b'M', 32 + cb, clamp(col), clamp(row)]
         }
     })
 }
+
+#[cfg(test)]
+mod tests;
