@@ -3,6 +3,13 @@
 - tab bar resize doesn't trigger output change animation
 
 
+## Selection & clipboard
+- left-drag in the terminal pane selects text; the selected cells are shown reversed
+- releasing the drag copies the selection to the host clipboard via OSC 52
+- a plain click (no drag) in the pane clears any selection
+- scrolling or resizing the pane clears the selection (its grid coordinates go stale)
+
+
 ## Search row
 - before all tabs, there is one search line that filters tabs based on input
 - search row can be selected by mouse

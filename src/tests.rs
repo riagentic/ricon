@@ -101,6 +101,7 @@ fn test_app(shell_counts: &[usize]) -> App {
         shown: Vec::new(),
         proc_cursor: 0,
         reaped: Instant::now(),
+        selection: None,
         quit: false,
     };
     app.refresh_shown();
@@ -131,6 +132,31 @@ fn line_text(line: &Line) -> String {
 fn truncate_tail_keeps_short_strings() {
     assert_eq!(truncate_tail("abc", 26, 5), "abc");
     assert_eq!(truncate_tail("", 26, 5), "");
+}
+
+#[test]
+fn base64_matches_rfc4648_vectors() {
+    // Padding at every residue, plus the two clipboard-relevant bytes 62/63.
+    assert_eq!(base64(b""), "");
+    assert_eq!(base64(b"f"), "Zg==");
+    assert_eq!(base64(b"fo"), "Zm8=");
+    assert_eq!(base64(b"foo"), "Zm9v");
+    assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    assert_eq!(base64(&[0xff, 0xef]), "/+8=");
+}
+
+#[test]
+fn selection_cells_are_reading_order() {
+    // Single row: an inclusive column span.
+    assert_eq!(selection_cells((2, 3), (2, 5), 10), [(2, 3), (2, 4), (2, 5)]);
+    // Multi row: tail of the first row, full middle rows, head of the last.
+    assert_eq!(selection_cells((0, 2), (2, 1), 3), [(0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (2, 1)]);
+}
+
+#[test]
+fn order_normalizes_into_reading_order() {
+    assert_eq!(order((5, 0), (1, 9)), ((1, 9), (5, 0)));
+    assert_eq!(order((2, 7), (2, 3)), ((2, 3), (2, 7)));
 }
 
 #[test]
@@ -580,6 +606,60 @@ fn shell_runs_commands_and_shows_output() {
         screen_contents(&shell)
     );
     assert_eq!(shell.cwd.as_deref(), Some(dir.as_path()));
+}
+
+#[test]
+fn pane_drag_selects_text_reverses_it_and_copies() {
+    // Kata ui.md: dragging in the pane selects text and copies it (OSC 52).
+    let mut app = test_app(&[1]);
+    let tok = "RICON_SELECT_ME";
+    {
+        let shell = app.tabs[0].active_shell_mut();
+        assert!(wait_for(|| shell.activity.load(Ordering::Relaxed) > 0, Duration::from_secs(10)), "prompt");
+        type_and_enter(shell, &format!("echo {tok}"));
+        assert!(
+            wait_for(|| screen_contents(shell).matches(tok).count() >= 2, Duration::from_secs(10)),
+            "echo + output visible, got: {:?}",
+            screen_contents(shell)
+        );
+    }
+    // Select the token on the echoed command line — it sits past the prompt,
+    // clear of the pane's leftmost column (which is the sidebar-resize handle).
+    let (row, col) = {
+        let contents = screen_contents(app.tabs[0].active_shell());
+        contents
+            .lines()
+            .enumerate()
+            .find_map(|(r, line)| line.find(tok).map(|c| (r as u16, c as u16)))
+            .expect("token on screen")
+    };
+    assert!(col > 1, "token clear of the resize handle, at col {col}");
+    let sw = app.sidebar_width;
+    let end = col + tok.len() as u16 - 1;
+    let ev = |kind, c: u16| MouseEvent { kind, column: sw + c, row, modifiers: KeyModifiers::NONE };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), col)).expect("press");
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), end)).expect("drag");
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), end)).expect("release");
+
+    // Release ends the drag, keeps the selection, and yields the copied text.
+    let sel = app.selection.expect("selection survives release");
+    assert!(!sel.dragging, "release ends the drag");
+    assert_eq!(app.selection_text(sel).as_deref(), Some(tok));
+
+    // Rendered: exactly the token's cells are reversed, nothing past it.
+    let buf = render(&mut app, sw + 80, 25);
+    for c in 0..tok.len() as u16 {
+        assert!(cell(&buf, sw + col + c, row).modifier.contains(Modifier::REVERSED), "cell {c} reversed");
+    }
+    assert!(
+        !cell(&buf, sw + col + tok.len() as u16, row).modifier.contains(Modifier::REVERSED),
+        "cell past the token is untouched"
+    );
+
+    // A plain click (press+release, no movement) deselects.
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), col)).expect("click");
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), col)).expect("release click");
+    assert!(app.selection.is_none(), "click deselects");
 }
 
 #[test]

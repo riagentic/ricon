@@ -23,6 +23,7 @@ A fast terminal console with **vertical tabs** — built with [ratatui](https://
 - ⭐ **Favorites** — `Alt+f` pins a tab into the favorites block at the top of the sidebar.
 - 🔎 **Search** — a search row above the tabs (focused at start, or `Ctrl+F`) filters tabs by path as you type.
 - ⏵ **Replay** — a red `replay` button beside each process re-runs the shell's last command on click or `Alt+r`.
+- 📋 **Select & copy** — drag to select text in the terminal pane; releasing copies it to the system clipboard (OSC 52).
 - 🎨 **Distinct tab colors** — a cohesive cool-jewel palette, each tab a different hue.
 - 💾 **Session persistence** — reopens tabs, subshells, favorites and the active selection at their folders, replaying the command that was running in each shell.
 - 🌿 **Git-aware status bar** — current path, active branch, and the app version pinned to the right corner.

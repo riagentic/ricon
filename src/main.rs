@@ -24,7 +24,7 @@ use ratatui::{
         execute, terminal,
     },
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style, Stylize},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem},
 };
@@ -478,6 +478,18 @@ struct TermModes {
     mouse_encoding: MouseProtocolEncoding,
 }
 
+/// A live text selection in the terminal pane. Coordinates are visible-grid
+/// (row, col) cells; `shell` binds the selection to the tab+shell it was made
+/// in, so it is only drawn (and copied) while that shell is on screen.
+#[derive(Clone, Copy)]
+struct Selection {
+    shell: (usize, usize),
+    anchor: (u16, u16),
+    head: (u16, u16),
+    /// True while the left button is held — drag extends `head`; release copies.
+    dragging: bool,
+}
+
 // ── app ──────────────────────────────────────────────────────────────────────
 
 struct App {
@@ -533,6 +545,9 @@ struct App {
     /// Last shell reaped — reaping runs at 10 Hz, not every frame, since
     /// `try_wait` per shell is a syscall and O(shells) on the hot path.
     reaped: Instant,
+    /// Live text selection in the pane (left-drag), copied to the host
+    /// clipboard on release via OSC 52. `None` when nothing is selected.
+    selection: Option<Selection>,
     /// Set by Ctrl+q; the loop then shuts every shell down and exits.
     quit: bool,
 }
@@ -582,6 +597,7 @@ impl App {
             shown: Vec::new(),
             proc_cursor: 0,
             reaped: Instant::now(),
+            selection: None,
             quit: false,
         };
         // Restore the persisted tabs at their saved folders, replaying each
@@ -885,6 +901,30 @@ impl App {
     /// Sidebar-border drags resize the panel; everything else over the
     /// terminal pane is forwarded to the inner app (when it asked for mouse).
     fn on_mouse(&mut self, mouse: MouseEvent) -> Result<(), Box<dyn Error>> {
+        // A live left-drag selection owns the mouse: extend it on drag (clamped
+        // to the pane grid) and copy to the clipboard on release. A release with
+        // no movement is a plain click, which just clears the selection.
+        let (sw, pr, pc) = (self.sidebar_width, self.pty_rows, self.pty_cols);
+        match (self.selection.as_mut(), mouse.kind) {
+            (Some(sel), MouseEventKind::Drag(MouseButton::Left)) if sel.dragging => {
+                sel.head = (
+                    mouse.row.min(pr.saturating_sub(1)),
+                    mouse.column.saturating_sub(sw).min(pc.saturating_sub(1)),
+                );
+                return Ok(());
+            }
+            (Some(sel), MouseEventKind::Up(MouseButton::Left)) if sel.dragging => {
+                sel.dragging = false;
+                let sel = *sel;
+                if sel.anchor == sel.head {
+                    self.selection = None;
+                } else {
+                    self.copy_selection(sel)?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         let border = self.sidebar_width.saturating_sub(1);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) if mouse.column.abs_diff(border) <= 1 => {
@@ -905,6 +945,7 @@ impl App {
             // selects that terminal and the specific shell whose row was hit,
             // and arms the tab for drag-reordering.
             MouseEventKind::Down(MouseButton::Left) if mouse.column < self.sidebar_width => {
+                self.selection = None;
                 if let Some((index, shell)) = self.replay_at(mouse.row, mouse.column) {
                     self.active = index;
                     self.tabs[index].active = shell;
@@ -960,12 +1001,27 @@ impl App {
             // inner app grabbed the mouse, in which case it's forwarded.
             if modes.mouse_mode == MouseProtocolMode::None {
                 match mouse.kind {
+                    // Scrolling shifts the grid under any selection, so drop it.
                     MouseEventKind::ScrollUp => {
+                        self.selection = None;
                         self.tabs[self.active].active_shell().scroll(SCROLL_STEP as isize);
                         return Ok(());
                     }
                     MouseEventKind::ScrollDown => {
+                        self.selection = None;
                         self.tabs[self.active].active_shell().scroll(-(SCROLL_STEP as isize));
+                        return Ok(());
+                    }
+                    // Left-press starts a text selection anchored at this cell;
+                    // a plain shell doesn't want the mouse, so it isn't forwarded.
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let anchor = (mouse.row, mouse.column - self.sidebar_width);
+                        self.selection = Some(Selection {
+                            shell: (self.active, self.tabs[self.active].active),
+                            anchor,
+                            head: anchor,
+                            dragging: true,
+                        });
                         return Ok(());
                     }
                     _ => {}
@@ -1127,6 +1183,25 @@ impl App {
         (0, 0)
     }
 
+    /// The selected screen text, read in reading order with the end cell made
+    /// inclusive. `None` when the shell has closed or the selection is blank.
+    fn selection_text(&self, sel: Selection) -> Option<String> {
+        let (t, s) = sel.shell;
+        let shell = self.tabs.get(t).and_then(|tab| tab.shells.get(s))?;
+        let (a, b) = order(sel.anchor, sel.head);
+        let text = shell.screen_between(a, (b.0, (b.1 + 1).min(self.pty_cols)));
+        let text = text.trim_end().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Push the current selection to the host terminal's clipboard via OSC 52.
+    fn copy_selection(&self, sel: Selection) -> Result<(), Box<dyn Error>> {
+        if let Some(text) = self.selection_text(sel) {
+            copy_osc52(&text)?;
+        }
+        Ok(())
+    }
+
     /// Drop shells whose child has exited, then tabs left with no shell,
     /// keeping every active index pointed at a surviving neighbour.
     fn reap_dead_tabs(&mut self) {
@@ -1168,6 +1243,7 @@ impl App {
         let cols = area.width - self.sidebar_width;
         if (rows, cols) != (self.pty_rows, self.pty_cols) {
             (self.pty_rows, self.pty_cols) = (rows, cols);
+            self.selection = None; // grid reflowed — old cell coords are stale
             for tab in &mut self.tabs {
                 tab.resize(rows, cols);
             }
@@ -1225,6 +1301,19 @@ fn draw(frame: &mut Frame, app: &mut App) {
         let shell = tab.active_shell();
         let parser = shell.parser.lock().unwrap_or_else(PoisonError::into_inner);
         frame.render_widget(PseudoTerminal::new(parser.screen()), pane);
+        // Overlay the live selection by reversing its cells, in reading order.
+        if let Some(sel) = app.selection.filter(|s| s.shell == (app.active, tab.active)) {
+            let (a, b) = order(sel.anchor, sel.head);
+            let buf = frame.buffer_mut();
+            for (r, c) in selection_cells(a, b, app.pty_cols) {
+                if r < pane.height
+                    && c < pane.width
+                    && let Some(cell) = buf.cell_mut((pane.x + c, pane.y + r))
+                {
+                    cell.modifier.insert(Modifier::REVERSED);
+                }
+            }
+        }
         frame.render_widget(
             status_bar(
                 app.active,
@@ -1771,6 +1860,50 @@ fn encode_key(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
         bytes.insert(0, 0x1b);
     }
     Some(bytes)
+}
+
+/// Order two (row, col) cells into reading order (top-to-bottom, left-to-right).
+fn order(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// The (row, col) cells covered by a reading-order selection from `a` to `b`
+/// (inclusive) on a grid `cols` wide — a partial first row, full middle rows,
+/// and a partial last row, matching what `contents_between` returns as text.
+fn selection_cells(a: (u16, u16), b: (u16, u16), cols: u16) -> Vec<(u16, u16)> {
+    let mut cells = Vec::new();
+    if a.0 == b.0 {
+        cells.extend((a.1..=b.1).map(|c| (a.0, c)));
+    } else {
+        cells.extend((a.1..cols).map(|c| (a.0, c)));
+        cells.extend((a.0 + 1..b.0).flat_map(|r| (0..cols).map(move |c| (r, c))));
+        cells.extend((0..=b.1).map(|c| (b.0, c)));
+    }
+    cells
+}
+
+/// Push `text` to the host terminal's clipboard with an OSC 52 sequence,
+/// written straight to stdout (inline, cursor-neutral — safe between frames).
+fn copy_osc52(text: &str) -> std::io::Result<()> {
+    let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let mut out = std::io::stdout().lock();
+    out.write_all(seq.as_bytes())?;
+    out.flush()
+}
+
+/// Standard (RFC 4648) base64 with padding — no dependency, OSC 52 wants it.
+fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 /// Translate a mouse event into the inner app's requested mouse protocol.
