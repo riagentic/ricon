@@ -102,7 +102,9 @@ fn test_app(shell_counts: &[usize]) -> App {
         proc_cursor: 0,
         reaped: Instant::now(),
         selection: None,
+        copied_at: None,
         quit: false,
+        confirm_quit: None,
     };
     app.refresh_shown();
     app
@@ -154,6 +156,18 @@ fn selection_cells_are_reading_order() {
 }
 
 #[test]
+fn copy_button_x_is_flush_left_of_the_version() {
+    let version = concat!("v", env!("CARGO_PKG_VERSION"), " ").chars().count() as u16;
+    let btn = COPY_BUTTON.chars().count() as u16;
+    assert_eq!(copy_button_x(80), Some((80 - version - btn, 80 - version)));
+    // Too narrow to leave any left segment: dropped rather than squeezed.
+    assert_eq!(copy_button_x(version + btn), None);
+    assert_eq!(copy_button_x(version), None);
+    assert_eq!(copy_button_x(0), None);
+    assert_eq!(copy_button_x(version + btn + 1), Some((1, btn + 1)));
+}
+
+#[test]
 fn order_normalizes_into_reading_order() {
     assert_eq!(order((5, 0), (1, 9)), ((1, 9), (5, 0)));
     assert_eq!(order((2, 7), (2, 3)), ((2, 3), (2, 7)));
@@ -172,6 +186,19 @@ fn truncate_tail_is_char_safe_on_multibyte() {
 }
 
 #[test]
+fn truncate_head_keeps_command_start_and_is_char_safe() {
+    // Fits within width - pad: unchanged (a command reads from its front).
+    assert_eq!(truncate_head("cargo test", 20, 7), "cargo test");
+    // Overflows: keep the head, mark the elided tail with a single `…`.
+    assert_eq!(truncate_head("cargo test --all-features", 15, 7), "cargo t…");
+    assert!(truncate_head("cargo test --all-features", 15, 7).chars().count() <= 8);
+    // width <= pad leaves room only for the ellipsis.
+    assert_eq!(truncate_head("anything", 7, 7), "…");
+    // Multibyte: truncates on char boundaries, never mid-byte.
+    assert_eq!(truncate_head("caféééééé", 12, 7), "café…");
+}
+
+#[test]
 fn expand_home_handles_tilde_forms() {
     let home = std::env::var("HOME").expect("HOME set");
     assert_eq!(expand_home("~"), PathBuf::from(&home));
@@ -184,7 +211,10 @@ fn expand_home_handles_tilde_forms() {
 fn abbreviate_home_shortens_only_home_prefix() {
     let home = std::env::var("HOME").expect("HOME set");
     assert_eq!(abbreviate_home(&format!("{home}/code")), "~/code");
+    assert_eq!(abbreviate_home(&home), "~");
     assert_eq!(abbreviate_home("/usr/lib"), "/usr/lib");
+    // A sibling sharing the home prefix but not `/`-bounded is left intact.
+    assert_eq!(abbreviate_home(&format!("{home}ext")), format!("{home}ext"));
 }
 
 #[test]
@@ -645,6 +675,7 @@ fn pane_drag_selects_text_reverses_it_and_copies() {
     let sel = app.selection.expect("selection survives release");
     assert!(!sel.dragging, "release ends the drag");
     assert_eq!(app.selection_text(sel).as_deref(), Some(tok));
+    assert!(app.copied_at.is_some(), "the copy is recorded to fire the footer hint");
 
     // Rendered: exactly the token's cells are reversed, nothing past it.
     let buf = render(&mut app, sw + 80, 25);
@@ -655,11 +686,214 @@ fn pane_drag_selects_text_reverses_it_and_copies() {
         !cell(&buf, sw + col + tok.len() as u16, row).modifier.contains(Modifier::REVERSED),
         "cell past the token is untouched"
     );
+    // The footer flashes a transient "✓ copied" confirmation right after a copy.
+    assert!(row_text(&buf, 24, sw + 80).contains("copied"), "footer hint: {:?}", row_text(&buf, 24, sw + 80));
 
-    // A plain click (press+release, no movement) deselects.
+    // A plain click (press+release, no movement) deselects and copies nothing.
+    app.copied_at = None;
     app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), col)).expect("click");
     app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), col)).expect("release click");
     assert!(app.selection.is_none(), "click deselects");
+    assert!(app.copied_at.is_none(), "a no-move click copies nothing");
+}
+
+#[test]
+fn ctrl_c_copies_the_selection_then_falls_back_to_sigint() {
+    // Kata ui.md: Ctrl+C copies while a selection is live, and is forwarded as
+    // SIGINT the moment there is none — so it never shadows the shell's Ctrl+C.
+    let mut app = test_app(&[1]);
+    let tok = "RICON_CTRL_C_COPY";
+    {
+        let shell = app.tabs[0].active_shell_mut();
+        assert!(wait_for(|| shell.activity.load(Ordering::Relaxed) > 0, Duration::from_secs(10)), "prompt");
+        type_and_enter(shell, &format!("echo {tok}"));
+        assert!(
+            wait_for(|| screen_contents(shell).matches(tok).count() >= 2, Duration::from_secs(10)),
+            "echo + output visible, got: {:?}",
+            screen_contents(shell)
+        );
+    }
+    let (row, col) = {
+        let contents = screen_contents(app.tabs[0].active_shell());
+        contents
+            .lines()
+            .enumerate()
+            .find_map(|(r, line)| line.find(tok).map(|c| (r as u16, c as u16)))
+            .expect("token on screen")
+    };
+    let sw = app.sidebar_width;
+    let ev = |kind, c: u16| MouseEvent { kind, column: sw + c, row, modifiers: KeyModifiers::NONE };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), col)).expect("press");
+    let end = col + tok.len() as u16 - 1;
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), end)).expect("drag");
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), end)).expect("release");
+    app.copied_at = None; // ignore the copy the release itself made
+
+    // With a selection live, Ctrl+C copies it and clears it — nothing is sent
+    // to the shell, so the screen is unchanged.
+    let sel = app.selection.expect("selection");
+    assert_eq!(app.selection_text(sel).as_deref(), Some(tok));
+    let before = screen_contents(app.tabs[0].active_shell());
+    app.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)).expect("ctrl+c");
+    assert!(app.copied_at.is_some(), "ctrl+c copies the selection");
+    assert!(app.selection.is_none(), "ctrl+c clears the selection so the next one interrupts");
+    assert_eq!(screen_contents(app.tabs[0].active_shell()), before, "ctrl+c was not forwarded");
+
+    // With nothing selected it reaches the shell: bash echoes "^C" and re-prompts.
+    app.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)).expect("ctrl+c again");
+    assert!(
+        wait_for(|| screen_contents(app.tabs[0].active_shell()).contains("^C"), Duration::from_secs(10)),
+        "ctrl+c reaches the shell, got: {:?}",
+        screen_contents(app.tabs[0].active_shell())
+    );
+}
+
+#[test]
+fn footer_copy_button_copies_the_selection_or_the_whole_screen() {
+    // Kata ui.md: the footer's `⧉ copy` button (flush left of the version) is
+    // the copy path that survives an app owning the mouse and Ctrl+C. It copies
+    // the live selection, or the whole visible screen when there is none, and
+    // never clears the selection.
+    let mut app = test_app(&[1]);
+    let tok = "RICON_BUTTON_COPY";
+    {
+        let shell = app.tabs[0].active_shell_mut();
+        assert!(wait_for(|| shell.activity.load(Ordering::Relaxed) > 0, Duration::from_secs(10)), "prompt");
+        type_and_enter(shell, &format!("echo {tok}"));
+        assert!(
+            wait_for(|| screen_contents(shell).matches(tok).count() >= 2, Duration::from_secs(10)),
+            "echo + output visible, got: {:?}",
+            screen_contents(shell)
+        );
+    }
+    let (w, h) = (app.sidebar_width + 80, 25);
+    app.term_width = w;
+    let buf = render(&mut app, w, h);
+    let (from, to) = copy_button_x(w).expect("the button fits an 80-column pane");
+    let footer = row_text(&buf, h - 1, w);
+    let label: String = footer.chars().skip(from as usize).take((to - from) as usize).collect();
+    assert_eq!(label, COPY_BUTTON, "button label sits at its hit-test columns: {footer:?}");
+    assert!(footer.ends_with(concat!("v", env!("CARGO_PKG_VERSION"), " ")), "version keeps the corner");
+    assert!(cell(&buf, from, h - 1).modifier.contains(Modifier::REVERSED), "drawn as a button");
+
+    let click = |app: &mut App, column: u16| {
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: app.pty_rows,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(ev).expect("footer click");
+    };
+    // Nothing selected: the button copies the visible screen — the escape hatch
+    // for an app that grabbed the mouse, where no drag selection can be made.
+    assert!(app.copy_text().expect("screen text").contains(tok), "no selection → the whole screen");
+    click(&mut app, from);
+    assert!(app.copied_at.is_some(), "clicking the button copies");
+    // Columns outside the button are not the button.
+    app.copied_at = None;
+    click(&mut app, from - 1);
+    click(&mut app, to);
+    assert!(app.copied_at.is_none(), "only the button's own columns copy");
+
+    // With a selection live, that wins — and survives the click (unlike Ctrl+C,
+    // which drops it so the next press interrupts).
+    let (row, col) = {
+        let contents = screen_contents(app.tabs[0].active_shell());
+        contents
+            .lines()
+            .enumerate()
+            .find_map(|(r, line)| line.find(tok).map(|c| (r as u16, c as u16)))
+            .expect("token on screen")
+    };
+    app.selection = Some(Selection {
+        shell: (0, 0),
+        anchor: (row, col),
+        head: (row, col + tok.len() as u16 - 1),
+        dragging: false,
+    });
+    assert_eq!(app.copy_text().as_deref(), Some(tok), "the selection wins over the screen");
+    click(&mut app, from);
+    assert!(app.copied_at.is_some(), "the click copies the selection");
+    assert!(app.selection.is_some(), "the button keeps the selection");
+
+    // The "✓ copied" hint lands beside the button, never over it.
+    let buf = render(&mut app, w, h);
+    let footer = row_text(&buf, h - 1, w);
+    let label: String = footer.chars().skip(from as usize).take((to - from) as usize).collect();
+    assert!(footer.contains("copied"), "hint shows: {footer:?}");
+    assert_eq!(label, COPY_BUTTON, "hint does not cover the button: {footer:?}");
+}
+
+#[test]
+fn bypass_drag_copies_over_a_mouse_grabbing_app() {
+    // Kata ui.md: Alt (or Shift) + drag selects and copies console text even when
+    // the inner app has grabbed the mouse (vim/less/htop); a plain drag there
+    // forwards. Either bypass selects the pane grid only — never sidebar text.
+    let mut app = test_app(&[1]);
+    let tok = "RICON_BYPASS_COPY";
+    {
+        let shell = app.tabs[0].active_shell_mut();
+        assert!(wait_for(|| shell.activity.load(Ordering::Relaxed) > 0, Duration::from_secs(10)), "prompt");
+        // Print the token, then turn on mouse reporting exactly as a TUI would.
+        type_and_enter(shell, &format!("echo {tok}; printf '\\033[?1000h'"));
+        assert!(
+            wait_for(|| screen_contents(shell).matches(tok).count() >= 2, Duration::from_secs(10)),
+            "token visible: {:?}",
+            screen_contents(shell)
+        );
+    }
+    assert!(
+        wait_for(
+            || app.tabs[0].active_shell().modes().mouse_mode != MouseProtocolMode::None,
+            Duration::from_secs(10)
+        ),
+        "inner app grabbed the mouse"
+    );
+    // Re-locate the token each time: a forwarded press can append to the prompt
+    // line, though never to the output rows the token sits on.
+    let find_tok = |app: &App| {
+        screen_contents(app.tabs[0].active_shell())
+            .lines()
+            .enumerate()
+            .find_map(|(r, line)| line.find(tok).map(|c| (r as u16, c as u16)))
+            .expect("token on screen")
+    };
+    let sw = app.sidebar_width;
+    let at = |kind, c: u16, r: u16, m| MouseEvent { kind, column: sw + c, row: r, modifiers: m };
+
+    // A plain press is forwarded to the app, so no local selection starts.
+    let (row, col) = find_tok(&app);
+    assert!(col > 1, "token clear of the resize handle, at col {col}");
+    app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), col, row, KeyModifiers::NONE)).expect("plain");
+    assert!(app.selection.is_none(), "a plain drag over a mouse app does not select");
+
+    // Alt+drag (host terminals keep Shift for themselves) and Shift+drag both
+    // select locally and copy on release — the bypass.
+    for m in [KeyModifiers::ALT, KeyModifiers::SHIFT] {
+        app.copied_at = None;
+        let (row, col) = find_tok(&app);
+        let end = col + tok.len() as u16 - 1;
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), col, row, m)).expect("press");
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), end, row, m)).expect("drag");
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), end, row, m)).expect("release");
+        let sel = app.selection.expect("bypass drag makes a selection");
+        assert_eq!(app.selection_text(sel).as_deref(), Some(tok), "only the console token is copied ({m:?})");
+        assert!(app.copied_at.is_some(), "the copy is recorded ({m:?})");
+    }
+
+    // Dragging back over the sidebar clamps to pane column 0: the selection is a
+    // pane-grid rectangle, so tab text can never enter it.
+    let (row, col) = find_tok(&app);
+    let alt = KeyModifiers::ALT;
+    app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), col, row, alt)).expect("press");
+    let into_sidebar =
+        MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 0, row, modifiers: alt };
+    app.on_mouse(into_sidebar).expect("drag into the sidebar");
+    let sel = app.selection.expect("selection survives the drag");
+    assert_eq!(sel.head.1, 0, "head clamps to the pane's first column");
+    let text = app.selection_text(sel).expect("text");
+    assert!(!text.contains('⌕') && !text.contains("ricon "), "no sidebar text in the copy: {text:?}");
 }
 
 #[test]
@@ -1102,6 +1336,31 @@ fn render_truncates_long_paths_in_narrow_sidebar() {
 }
 
 #[test]
+fn render_quit_dialog_centered_with_no_preselected() {
+    // Kata app.md: Ctrl+q shows a centered YES/NO confirmation, NO highlighted.
+    let mut app = test_app(&[1]);
+    app.confirm_quit = Some(false);
+    let buf = render(&mut app, W, H);
+    let question =
+        (0..H).map(|y| row_text(&buf, y, W)).find(|r| r.contains("Are you sure to Quit all tabs?"));
+    assert!(question.is_some(), "question is on screen");
+    let y = (0..H).find(|&y| row_text(&buf, y, W).contains("YES")).expect("buttons row");
+    let row = row_text(&buf, y, W);
+    let yes_x = row.find("YES").expect("YES") as u16;
+    let no_x = row.find(" NO ").expect("NO") as u16 + 1;
+    assert!(cell(&buf, no_x, y).modifier.contains(Modifier::REVERSED), "NO preselected: {row:?}");
+    assert!(!cell(&buf, yes_x, y).modifier.contains(Modifier::REVERSED), "YES not selected: {row:?}");
+
+    app.confirm_quit = Some(true);
+    let buf = render(&mut app, W, H);
+    assert!(cell(&buf, yes_x, y).modifier.contains(Modifier::REVERSED), "arrow highlights YES");
+
+    app.confirm_quit = None;
+    let buf = render(&mut app, W, H);
+    assert!(!(0..H).any(|y| row_text(&buf, y, W).contains("Are you sure")), "dialog gone when closed");
+}
+
+#[test]
 fn status_bar_truncates_left_but_pins_version_right() {
     let app = test_app(&[1]);
     let shell = app.tabs[0].active_shell();
@@ -1129,7 +1388,40 @@ fn shortcuts_drive_tab_selection_and_quit() {
     app.on_key(key(KeyCode::PageUp, KeyModifiers::ALT)).expect("alt+pgup");
     assert_eq!(app.active, 2, "previous wraps");
     app.on_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL)).expect("ctrl+q");
-    assert!(app.quit, "Ctrl+q quits gracefully");
+    assert!(!app.quit, "Ctrl+q alone no longer quits");
+    assert_eq!(app.confirm_quit, Some(false), "Ctrl+q opens the dialog with NO preselected");
+}
+
+#[test]
+fn quit_dialog_arrows_toggle_enter_confirms_esc_cancels() {
+    // Kata app.md: Ctrl+q asks for confirmation; only YES + Enter quits.
+    let mut app = test_app(&[1]);
+    app.search_focus = false;
+    app.on_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL)).expect("ctrl+q");
+    app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)).expect("enter");
+    assert!(!app.quit, "Enter on the preselected NO does not quit");
+    assert_eq!(app.confirm_quit, None, "NO closes the dialog");
+
+    app.on_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL)).expect("ctrl+q");
+    app.on_key(key(KeyCode::Esc, KeyModifiers::NONE)).expect("esc");
+    assert!(!app.quit, "Esc cancels");
+    assert_eq!(app.confirm_quit, None, "Esc closes the dialog");
+
+    app.on_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL)).expect("ctrl+q");
+    let before = screen_contents(app.tabs[0].active_shell());
+    app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE)).expect("x");
+    assert_eq!(
+        screen_contents(app.tabs[0].active_shell()),
+        before,
+        "keys are swallowed while the dialog is open"
+    );
+    app.on_key(key(KeyCode::Left, KeyModifiers::NONE)).expect("left");
+    assert_eq!(app.confirm_quit, Some(true), "arrow moves the highlight to YES");
+    app.on_key(key(KeyCode::Right, KeyModifiers::NONE)).expect("right");
+    assert_eq!(app.confirm_quit, Some(false), "arrow toggles back to NO");
+    app.on_key(key(KeyCode::Left, KeyModifiers::NONE)).expect("left");
+    app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)).expect("enter");
+    assert!(app.quit, "YES + Enter quits");
 }
 
 #[test]
@@ -1352,44 +1644,76 @@ fn search_hides_active_tab_without_breaking_reveal() {
 // ── replay button (kata app.md) ──────────────────────────────────────────────
 
 #[test]
-fn replay_button_renders_emoji_next_to_process() {
-    // Kata: a `replay` emoji next to the process name — but only while a shell
-    // is the foreground process.
+fn replay_row_shows_icon_and_full_command_below_process() {
+    // Kata tab: while a shell is the foreground process, the replay icon sits on
+    // its own row below the process row, with the full command it will replay.
     let mut app = test_app(&[1]);
     app.tabs[0].shells[0].process = "bash".into();
     app.tabs[0].shells[0].last_cmd = Some("deno task dev".into());
     let buf = render(&mut app, W, H);
-    let row = row_text(&buf, 4, W);
-    assert!(row.contains(&format!("└ bash  {REPLAY_LABEL}")), "button next to process: {row:?}");
-    let byte = row.find(REPLAY_LABEL).expect("button");
-    let x = row[..byte].chars().count() as u16; // column, not byte offset (multibyte gutter)
-    let style = cell(&buf, x, 4).style();
-    assert_eq!(style.fg, Some(REPLAY_COLOR), "button carries the replay color");
+    // Row 4 is the process row (no icon now); row 5 is the new replay row.
+    let process = row_text(&buf, 4, W);
+    assert!(process.contains("└ bash"), "process row: {process:?}");
+    assert!(!process.contains(REPLAY_LABEL), "icon left the process row: {process:?}");
+    let replay = row_text(&buf, 5, W);
+    // The icon renders two cells wide, so its continuation cell shows as a space
+    // in extracted text; assert the icon and the full command, not exact gaps.
+    assert!(
+        replay.contains(REPLAY_LABEL) && replay.contains("deno task dev"),
+        "icon + full command on the new row: {replay:?}"
+    );
+    let byte = replay.find(REPLAY_LABEL).expect("icon");
+    let x = replay[..byte].chars().count() as u16; // column, not byte offset (multibyte gutter)
+    let style = cell(&buf, x, 5).style();
+    assert_eq!(style.fg, Some(REPLAY_COLOR), "icon carries the replay color");
     assert!(style.add_modifier.contains(Modifier::BOLD));
-    // A non-shell program owns the tty → no button, even with a captured command.
+    // A non-shell program owns the tty → no replay row, even with a captured command.
     app.tabs[0].shells[0].process = "deno".into();
     let buf = render(&mut app, W, H);
-    assert!(!row_text(&buf, 4, W).contains(REPLAY_LABEL), "hidden while a program runs");
-    // No last command → no button.
+    assert!((0..H).all(|y| !row_text(&buf, y, W).contains(REPLAY_LABEL)), "hidden while a program runs");
+    // No last command → no replay row.
     app.tabs[0].shells[0].process = "bash".into();
     app.tabs[0].shells[0].last_cmd = None;
     let buf = render(&mut app, W, H);
-    assert!(!row_text(&buf, 4, W).contains(REPLAY_LABEL), "hidden without a last command");
+    assert!((0..H).all(|y| !row_text(&buf, y, W).contains(REPLAY_LABEL)), "hidden without a last command");
+}
+
+#[test]
+fn replay_row_grows_tab_and_tracks_hit_testing() {
+    // Kata tab: the replay row adds a row while a shell is replayable, so the
+    // tab height and the sidebar row hit-testing must track it.
+    let mut app = test_app(&[1]);
+    assert_eq!(app.tabs[0].rows(), 4, "no replay row before anything is captured");
+    app.tabs[0].shells[0].process = "bash".into();
+    app.tabs[0].shells[0].last_cmd = Some("cargo test".into());
+    assert_eq!(app.tabs[0].rows(), 5, "a replay row grows the tab by one");
+    // Rows: title, search, name(2), path(3), process(4), replay(5), separator(6).
+    assert_eq!(app.shell_at_row(5), Some((0, 0)), "the replay row belongs to its shell");
+    assert_eq!(app.replay_at(5, 5), Some((0, 0)), "the icon hit-tests on the replay row");
+    assert_eq!(app.shell_at_row(6), Some((0, 0)), "the separator follows the replay row");
+    // The button spans the icon through the command it re-runs: `{bar}    🔁 ` is
+    // REPLAY_PAD (8) columns, then the 10 columns of `cargo test`.
+    assert_eq!(app.replay_at(5, 17), Some((0, 0)), "the command's last column is still the button");
+    assert_eq!(app.replay_at(5, 18), None, "past the command's end misses");
+    // Losing replayability shrinks it back and removes the button.
+    app.tabs[0].shells[0].last_cmd = None;
+    assert_eq!(app.tabs[0].rows(), 4, "shrinks back when the command clears");
+    assert!((0..8).all(|r| app.replay_at(r, 5).is_none()), "no button target once shrunk");
 }
 
 #[test]
 fn replay_suppressed_while_non_shell_in_foreground() {
-    // Kata app.md §94: replay (button hit-test + Alt+r) is offered only while a
-    // shell owns the tty, never next to another program.
+    // Kata app.md §94: replay (icon hit-test + Alt+r) is offered only while a
+    // shell owns the tty, never for another program.
     let mut app = test_app(&[1]);
     app.tabs[0].shells[0].last_cmd = Some("echo hi".into());
     app.tabs[0].shells[0].process = "deno".into();
-    let col = (6 + "deno".len() + 2) as u16;
-    assert_eq!(app.replay_at(4, col), None, "no button while a program runs");
-    // A shell in the foreground restores it.
+    // A program in the foreground → no replay row exists, so nothing hits.
+    assert!((0..8).all(|r| app.replay_at(r, 5).is_none()), "no icon while a program runs");
+    // A shell restores the replay row (below the process row) with its icon.
     app.tabs[0].shells[0].process = "bash".into();
-    let col = (6 + "bash".len() + 2) as u16;
-    assert_eq!(app.replay_at(4, col), Some((0, 0)), "button back at the shell prompt");
+    assert_eq!(app.replay_at(5, 5), Some((0, 0)), "icon back on the replay row at the shell prompt");
+    assert_eq!(app.replay_at(4, 5), None, "the process row itself has no icon");
 }
 
 #[test]
@@ -1495,17 +1819,20 @@ fn replay_types_and_confirms_via_alt_r_and_click() {
         ),
         "Alt+r typed and confirmed the command"
     );
-    // Click on the button: the hit-test targets exactly the label span.
+    // Click on the button: the hit-test spans the icon (column 5, one space past
+    // the process `└`) through the command text on the replay row (buffer row 5).
     app.tabs[0].shells[0].process = "bash".into();
     app.tabs[0].shells[0].last_cmd = Some("echo RICON_REPLAY_$((2+2))".into());
-    let col = (6 + "bash".len() + 2) as u16; // `{bar}   └ bash` + two-space gap
-    assert_eq!(app.replay_at(4, col), Some((0, 0)), "click lands on the button");
-    assert_eq!(app.replay_at(4, col - 1), None, "gap before the button misses");
-    assert_eq!(app.replay_at(3, col), None, "path row has no button");
+    assert_eq!(app.replay_at(5, 5), Some((0, 0)), "click lands on the icon");
+    assert_eq!(app.replay_at(5, 4), None, "the indent before the icon misses");
+    assert_eq!(app.replay_at(4, 5), None, "the process row has no icon");
+    // The command is head-truncated to the sidebar, so it runs to the last column.
+    assert_eq!(app.replay_at(5, app.sidebar_width - 1), Some((0, 0)), "the command text is the button too");
+    // A click on the command — not the icon — replays it.
     let click = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: col,
-        row: 4,
+        column: 12,
+        row: 5,
         modifiers: KeyModifiers::NONE,
     };
     app.on_mouse(click).expect("click replay");

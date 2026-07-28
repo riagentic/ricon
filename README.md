@@ -23,7 +23,7 @@ A fast terminal console with **vertical tabs** — built with [ratatui](https://
 - ⭐ **Favorites** — `Alt+f` pins a tab into the favorites block at the top of the sidebar.
 - 🔎 **Search** — a search row above the tabs (focused at start, or `Ctrl+F`) filters tabs by path as you type.
 - ⏵ **Replay** — a red `replay` button beside each process re-runs the shell's last command on click or `Alt+r`.
-- 📋 **Select & copy** — drag to select text in the terminal pane; releasing copies it to the system clipboard (OSC 52).
+- 📋 **Select & copy** — drag to select text in the terminal pane (pane content only, never the sidebar); releasing — or `Ctrl+c` — copies it to the system clipboard. Over an app that grabbed the mouse, hold **Alt** while dragging — most host terminals keep `Shift`+drag for their own selection, which spans the whole window. When an app owns both the mouse and `Ctrl+c`, click **⧉ copy** in the status bar (left of the version): it copies the selection, or the whole visible screen when there is none — so no app shortcut has to be redefined. The copy goes out both as OSC 52 (ssh/tmux/kitty/wezterm) and to the local X11/Wayland clipboard, so it also lands under gnome-terminal & friends, which ignore OSC 52.
 - 🎨 **Distinct tab colors** — a cohesive cool-jewel palette, each tab a different hue.
 - 💾 **Session persistence** — reopens tabs, subshells, favorites and the active selection at their folders, replaying the command that was running in each shell.
 - 🌿 **Git-aware status bar** — current path, active branch, and the app version pinned to the right corner.
@@ -73,6 +73,9 @@ ricon ~/code     # base path = given directory; the first shell starts here
 | Click / drag a tab | Select tab & shell / reorder |
 | Wheel over sidebar | Scroll the tab list |
 | Wheel over pane | Scroll terminal history |
+| Drag in pane | Select pane text → clipboard (`Alt`+drag over mouse-driven apps) |
+| `Ctrl+c` | Copy the selection (with nothing selected: plain SIGINT to the shell) |
+| Click `⧉ copy` in the status bar | Copy the selection, or the whole visible screen when nothing is selected |
 
 ## How it works
 
@@ -81,6 +84,7 @@ ricon ~/code     # base path = given directory; the first shell starts here
 - The render path does no filesystem or `/proc` IO: cwd/process/agent facts are sampled at 2 Hz, the git branch at 500 ms, and the session persists at 1 Hz (with a final write on quit).
 - AI-agent detection walks `/proc` for known agent processes descending from the tab's shell, then resolves the live model from the agent's own state (settings file, env, log tail, or opencode's SQLite store) — read-only, so the agent is never disturbed.
 - Sessions persist to `$XDG_STATE_HOME/ricon/session` (or `~/.local/state/ricon/session`).
+- Copies take both routes at once: an OSC 52 sequence for the host terminal (the only path that survives ssh) and the local desktop selection via `arboard` (X11/Wayland), which is what makes copy work on VTE-based terminals that drop OSC 52.
 
 > **Platform:** Linux (agent detection and process inspection read `/proc`).
 

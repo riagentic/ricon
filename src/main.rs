@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, OnceLock, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -26,7 +26,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{Block, Borders, Clear, List, ListItem},
 };
 use tui_term::{
     vt100::{self, MouseProtocolEncoding, MouseProtocolMode},
@@ -37,6 +37,11 @@ const SIDEBAR_WIDTH: u16 = 26;
 const MIN_SIDEBAR_WIDTH: u16 = 8;
 const MIN_PANE_WIDTH: u16 = 10;
 const POLL_INTERVAL: Duration = Duration::from_millis(30);
+/// How long the "✓ copied" footer hint lingers after a copy to the clipboard.
+const COPY_HINT: Duration = Duration::from_millis(1200);
+/// Label of the footer's clickable copy button, pinned just left of the
+/// version corner. Its width is fixed so render and hit-test agree.
+const COPY_BUTTON: &str = " ⧉ copy ";
 /// Host-side scrollback retained per tab, and lines moved per wheel notch.
 const SCROLLBACK_LINES: usize = 5000;
 const SCROLL_STEP: usize = 3;
@@ -293,6 +298,12 @@ impl Shell {
         }
     }
 
+    /// The whole visible grid as text — what the footer's copy button falls
+    /// back to with nothing selected.
+    fn screen_text(&self) -> String {
+        self.parser.lock().unwrap_or_else(PoisonError::into_inner).screen().contents()
+    }
+
     /// Screen cursor as (row, col) in the visible grid.
     fn cursor_position(&self) -> (u16, u16) {
         self.parser.lock().unwrap_or_else(PoisonError::into_inner).screen().cursor_position()
@@ -440,9 +451,12 @@ impl Tab {
         self.active_shell().read_cwd()
     }
 
-    /// Sidebar height: four rows for the parent, plus two per subshell.
+    /// Sidebar height: a name row and a blank separator bracket every shell's
+    /// path + process rows, plus one replay row per shell that is currently
+    /// replayable (kata tab) — so a tab grows and shrinks as commands are
+    /// captured or programs take the foreground.
     fn rows(&self) -> u16 {
-        4 + 2 * (self.shells.len() as u16 - 1)
+        2 + self.shells.iter().map(|s| 2 + s.replayable() as u16).sum::<u16>()
     }
 
     /// Cycle the active *shell within this tab* by `delta` (wrapping, Alt+Up/Down);
@@ -548,8 +562,16 @@ struct App {
     /// Live text selection in the pane (left-drag), copied to the host
     /// clipboard on release via OSC 52. `None` when nothing is selected.
     selection: Option<Selection>,
-    /// Set by Ctrl+q; the loop then shuts every shell down and exits.
+    /// When the last copy landed; a brief "✓ copied" footer hint shows while
+    /// this is within `COPY_HINT` of now. `None` until the first copy.
+    copied_at: Option<Instant>,
+    /// Set by confirming the quit dialog; the loop then shuts every shell
+    /// down and exits.
     quit: bool,
+    /// Quit-confirmation dialog: `None` when closed, `Some(yes)` when open
+    /// with YES (`true`) or NO (`false`) highlighted. Ctrl+q opens it with NO
+    /// preselected so a stray press can't kill every tab.
+    confirm_quit: Option<bool>,
 }
 
 /// One persisted shell: its folder and the command running in it (if any).
@@ -598,7 +620,9 @@ impl App {
             proc_cursor: 0,
             reaped: Instant::now(),
             selection: None,
+            copied_at: None,
             quit: false,
+            confirm_quit: None,
         };
         // Restore the persisted tabs at their saved folders, replaying each
         // tab's recorded command; fall back to a single base-path shell when
@@ -714,8 +738,35 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn Error>> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // The quit dialog is modal: arrows toggle YES/NO, Enter confirms,
+        // Esc cancels; every other key is swallowed so nothing leaks to the
+        // shell underneath.
+        if let Some(yes) = self.confirm_quit {
+            match key.code {
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
+                    self.confirm_quit = Some(!yes);
+                }
+                KeyCode::Enter => {
+                    self.quit = yes;
+                    self.confirm_quit = None;
+                }
+                KeyCode::Esc => self.confirm_quit = None,
+                _ => {}
+            }
+            return Ok(());
+        }
         match key.code {
-            KeyCode::Char('q') if ctrl => self.quit = true,
+            // Ctrl+C copies the live selection and drops it, so the very next
+            // Ctrl+C interrupts as usual. With nothing selected it is forwarded
+            // untouched — SIGINT is never shadowed.
+            KeyCode::Char('c') if ctrl && self.selection.is_some() => {
+                if let Some(sel) = self.selection.take()
+                    && self.copy_selection(sel)?
+                {
+                    self.copied_at = Some(Instant::now());
+                }
+            }
+            KeyCode::Char('q') if ctrl => self.confirm_quit = Some(false),
             KeyCode::Char('t' | 'n') if ctrl => self.open_tab()?,
             KeyCode::Char('w') if ctrl => self.close_active(),
             KeyCode::Char('f') if ctrl => self.search_focus = true,
@@ -768,6 +819,9 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
+        if self.confirm_quit.is_some() {
+            return Ok(());
+        }
         if self.tabs[self.active].active_shell().modes().bracketed_paste {
             self.write_active(format!("\x1b[200~{text}\x1b[201~").as_bytes())
         } else {
@@ -794,47 +848,55 @@ impl App {
         self.hit(row).map(|(tab, _, _)| tab)
     }
 
-    /// Tab and shell index under sidebar row `row` — the parent owns rows 0–2
-    /// (name, path, process), then each subshell owns two rows; the blank
-    /// separator maps to the parent.
+    /// Tab and shell index under sidebar row `row` — the name row and the blank
+    /// separator map to the parent; otherwise the shell whose path/process/replay
+    /// block was hit.
     fn shell_at_row(&self, row: u16) -> Option<(usize, usize)> {
         self.hit(row).map(|(tab, shell, _)| (tab, shell))
     }
 
-    /// Resolve sidebar row `row` against the shown tabs: the tab, the shell
-    /// whose rows were hit, and whether it was that shell's process row (where
-    /// the `replay` button lives). `None` above the tabs or past the last one.
+    /// Resolve sidebar row `row` against the shown tabs: the tab, the shell whose
+    /// rows were hit, and whether it was that shell's replay row (where the icon
+    /// lives). `None` above the tabs or past the last one. Walks each shell's
+    /// block — path, process, and a replay row while replayable — so it tracks
+    /// the same variable height `Tab::rows` reports.
     fn hit(&self, row: u16) -> Option<(usize, usize, bool)> {
         let mut r = (row as usize).checked_sub(2)?;
         for &i in self.shown.get(self.list_offset..)? {
             let tab = &self.tabs[i];
             let h = tab.rows() as usize;
             if r < h {
-                let shell = if r < 3 || r + 1 == h { 0 } else { 1 + (r - 3) / 2 };
-                let shell = shell.min(tab.shells.len() - 1);
-                // Parent process row is local row 2; subshell `s` owns rows
-                // 2s+1 (path) and 2s+2 (process).
-                let process_row = r + 1 != h && (if shell == 0 { r == 2 } else { r == 2 * shell + 2 });
-                return Some((i, shell, process_row));
+                // Local row 0 is the tab name and the last row is the blank
+                // separator; both belong to the parent and carry no icon.
+                if r == 0 || r + 1 == h {
+                    return Some((i, 0, false));
+                }
+                // The rows between are each shell's block: path, process, then a
+                // replay row (icon + command) while the shell is replayable.
+                let mut local = r - 1;
+                for (si, shell) in tab.shells.iter().enumerate() {
+                    let block = 2 + shell.replayable() as usize;
+                    if local < block {
+                        return Some((i, si, shell.replayable() && local == 2));
+                    }
+                    local -= block;
+                }
+                return Some((i, 0, false)); // unreachable: the blocks fill h - 2
             }
             r -= h;
         }
         None
     }
 
-    /// The (tab, shell) whose `replay` button sits under (`row`, `col`): a
-    /// process row, a last command to replay, and the click inside the button
-    /// label right after the process name (kept in sync with `process_row`).
+    /// The (tab, shell) whose `replay` button (`row`, `col`) hits: a replay row
+    /// (which `hit` only reports for a replayable shell) clicked anywhere from
+    /// the icon to the end of the command it re-runs — the whole `🔁 <command>`
+    /// stretch is the button, so a click needn't land on the two-cell emoji.
     fn replay_at(&self, row: u16, col: u16) -> Option<(usize, usize)> {
-        let (tab, shell, process_row) = self.hit(row)?;
-        let s = &self.tabs[tab].shells[shell];
-        if !process_row || !s.replayable() {
-            return None;
-        }
-        // `{bar}   └ {process}` is 6 columns of prefix, then 2 spaces of gap.
-        let start = 6 + s.process.chars().count() + 2;
-        let span = start..start + REPLAY_COLS;
-        span.contains(&(col as usize)).then_some((tab, shell))
+        let (tab, shell, replay_row) = self.hit(row)?;
+        (replay_row
+            && replay_span(&self.tabs[tab].shells[shell], self.sidebar_width).contains(&(col as usize)))
+        .then_some((tab, shell))
     }
 
     /// Shown tabs intersecting the sidebar viewport from the current scroll
@@ -901,6 +963,20 @@ impl App {
     /// Sidebar-border drags resize the panel; everything else over the
     /// terminal pane is forwarded to the inner app (when it asked for mouse).
     fn on_mouse(&mut self, mouse: MouseEvent) -> Result<(), Box<dyn Error>> {
+        // The quit dialog is modal: no clicking through it into the sidebar
+        // or the terminal pane.
+        if self.confirm_quit.is_some() {
+            return Ok(());
+        }
+        // The footer's copy button (just left of the version corner): a click
+        // copies the selection, or the whole screen when nothing is selected.
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+            && mouse.row == self.pty_rows
+            && let Some((from, to)) = copy_button_x(self.term_width)
+            && (from..to).contains(&mouse.column)
+        {
+            return self.copy_selection_or_screen();
+        }
         // A live left-drag selection owns the mouse: extend it on drag (clamped
         // to the pane grid) and copy to the clipboard on release. A release with
         // no movement is a plain click, which just clears the selection.
@@ -918,8 +994,8 @@ impl App {
                 let sel = *sel;
                 if sel.anchor == sel.head {
                     self.selection = None;
-                } else {
-                    self.copy_selection(sel)?;
+                } else if self.copy_selection(sel)? {
+                    self.copied_at = Some(Instant::now());
                 }
                 return Ok(());
             }
@@ -997,8 +1073,9 @@ impl App {
         }
         if mouse.column >= self.sidebar_width && mouse.row < self.pty_rows {
             let modes = self.tabs[self.active].active_shell().modes();
+            let bypass = mouse.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
             // Wheel over the pane scrolls this shell's scrollback — unless the
-            // inner app grabbed the mouse, in which case it's forwarded.
+            // inner app grabbed the mouse, in which case it's forwarded below.
             if modes.mouse_mode == MouseProtocolMode::None {
                 match mouse.kind {
                     // Scrolling shifts the grid under any selection, so drop it.
@@ -1012,20 +1089,29 @@ impl App {
                         self.tabs[self.active].active_shell().scroll(-(SCROLL_STEP as isize));
                         return Ok(());
                     }
-                    // Left-press starts a text selection anchored at this cell;
-                    // a plain shell doesn't want the mouse, so it isn't forwarded.
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let anchor = (mouse.row, mouse.column - self.sidebar_width);
-                        self.selection = Some(Selection {
-                            shell: (self.active, self.tabs[self.active].active),
-                            anchor,
-                            head: anchor,
-                            dragging: true,
-                        });
-                        return Ok(());
-                    }
                     _ => {}
                 }
+            }
+            // Left-press starts a text selection when the inner app isn't using
+            // the mouse, or whenever Alt/Shift is held — the bypass that lets you
+            // select console text even over a mouse-driven app (vim, less, htop).
+            // Alt is the one to reach for: host terminals (VTE, xterm, kitty,
+            // alacritty…) keep Shift+drag for their own window-wide selection, so
+            // those events never arrive here and the host highlights whole rows —
+            // sidebar tab text included. Alt is forwarded, so the selection stays
+            // inside the pane grid. A bypass drag is owned by ricon (the Drag/Up
+            // handlers above never forward it), so the app is otherwise untouched.
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && (modes.mouse_mode == MouseProtocolMode::None || bypass)
+            {
+                let anchor = (mouse.row, mouse.column - self.sidebar_width);
+                self.selection = Some(Selection {
+                    shell: (self.active, self.tabs[self.active].active),
+                    anchor,
+                    head: anchor,
+                    dragging: true,
+                });
+                return Ok(());
             }
             let (col, row) = (mouse.column - self.sidebar_width, mouse.row);
             if let Some(bytes) = encode_mouse(&mouse, col, row, &modes) {
@@ -1194,12 +1280,42 @@ impl App {
         (!text.is_empty()).then_some(text)
     }
 
-    /// Push the current selection to the host terminal's clipboard via OSC 52.
-    fn copy_selection(&self, sel: Selection) -> Result<(), Box<dyn Error>> {
-        if let Some(text) = self.selection_text(sel) {
-            copy_osc52(&text)?;
+    /// Push the current selection to the clipboard.
+    /// Returns whether any (non-blank) text was actually copied.
+    fn copy_selection(&self, sel: Selection) -> Result<bool, Box<dyn Error>> {
+        match self.selection_text(sel) {
+            Some(text) => {
+                copy_clipboard(&text)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// The footer copy button's action: copy the live selection, or the whole
+    /// visible screen when there is none. The selection survives (the button is
+    /// idempotent, unlike Ctrl+C which drops it so the next press interrupts).
+    /// This is the copy path that stays available under an app that owns the
+    /// mouse and Ctrl+C — no shortcut of the inner app is shadowed to get it.
+    fn copy_selection_or_screen(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Some(text) = self.copy_text() {
+            copy_clipboard(&text)?;
+            self.copied_at = Some(Instant::now());
         }
         Ok(())
+    }
+
+    /// The text that button would copy: the selection, else the visible screen.
+    /// `None` when both are blank — then the click is a no-op, hint included.
+    fn copy_text(&self) -> Option<String> {
+        match self.selection {
+            Some(sel) => self.selection_text(sel),
+            None => {
+                let text = self.tabs.get(self.active)?.active_shell().screen_text();
+                let text = text.trim_end().to_string();
+                (!text.is_empty()).then_some(text)
+            }
+        }
     }
 
     /// Drop shells whose child has exited, then tabs left with no shell,
@@ -1327,6 +1443,51 @@ fn draw(frame: &mut Frame, app: &mut App) {
             footer,
         );
     }
+    // Transient copy confirmation: a small "✓ copied" pinned to the footer for
+    // ~COPY_HINT after a copy, so the user sees it reached the clipboard. It
+    // lands just left of the copy button (never over it — the button has to
+    // stay clickable and legible right when it was used), and only briefly.
+    if app.copied_at.is_some_and(|t| t.elapsed() < COPY_HINT) {
+        const HINT: &str = " ✓ copied ";
+        // Right edge of the hint: the copy button's first column, or the
+        // footer's own edge when the footer is too narrow to carry a button.
+        let edge = copy_button_x(footer.width).map_or(footer.width, |(from, _)| from);
+        let w = (HINT.chars().count() as u16).min(edge);
+        let rect = Rect { x: footer.x + edge - w, y: footer.y, width: w, height: 1 };
+        frame.render_widget(
+            Line::from(HINT).style(Style::new().bg(Color::Green).fg(Color::Black).bold()),
+            rect,
+        );
+    }
+    if let Some(yes) = app.confirm_quit {
+        draw_quit_confirm(frame, yes);
+    }
+}
+
+/// Centered modal asking "Are you sure to Quit all tabs?" with YES / NO
+/// buttons; the highlighted one is rendered reversed. Drawn last so it sits
+/// on top of the sidebar and pane.
+fn draw_quit_confirm(frame: &mut Frame, yes: bool) {
+    const QUESTION: &str = "Are you sure to Quit all tabs?";
+    let area = frame.area();
+    let width = (QUESTION.len() as u16 + 4).min(area.width);
+    let height = 5.min(area.height);
+    let popup =
+        Rect { x: area.x + (area.width - width) / 2, y: area.y + (area.height - height) / 2, width, height };
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title(Line::from(" Quit ").bold().centered());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [question, _, buttons] = Layout::vertical([Constraint::Length(1); 3]).areas(inner);
+    frame.render_widget(Line::from(QUESTION).centered(), question);
+    let button = |label, selected: bool| {
+        let style = if selected { Style::new().bold().reversed() } else { Style::new().fg(Color::DarkGray) };
+        Span::styled(label, style)
+    };
+    frame.render_widget(
+        Line::from(vec![button("  YES  ", yes), Span::raw("   "), button("  NO  ", !yes)]).centered(),
+        buttons,
+    );
 }
 
 /// Footer: an up-down arrow when the tab list overflows, then the active
@@ -1345,17 +1506,36 @@ fn status_bar(
     let branch = branch.map_or_else(String::new, |b| format!("  ⎇ {b}"));
     let agent = shell.agent.as_ref().map_or_else(String::new, |a| format!("  ✳ {}", a.model));
     let right = format!("v{} ", env!("CARGO_PKG_VERSION"));
+    // The copy button is dropped entirely on a footer too narrow to hold it —
+    // `copy_button_x` decides that once, for both this render and the hit-test.
+    let button = if copy_button_x(width).is_some() { COPY_BUTTON } else { "" };
     // Scroll indicator sits before the active tab index when not all tabs fit.
     let scroll = if tabs_overflow { "↕ " } else { "" };
-    // Left segment, truncated so the right-corner version always fits.
+    // Left segment, truncated so the button and the right-corner version fit.
     let mut left = format!(" {scroll}{}/{count} ▸ {path}{branch}{agent}", index + 1);
-    let room = (width as usize).saturating_sub(right.chars().count());
+    let fixed = right.chars().count() + button.chars().count();
+    let room = (width as usize).saturating_sub(fixed);
     if left.chars().count() > room {
         left = left.chars().take(room).collect();
     }
-    let pad = (width as usize).saturating_sub(left.chars().count() + right.chars().count());
-    Line::from(format!("{left}{}{right}", " ".repeat(pad)))
-        .style(Style::new().bg(color).fg(Color::White).bold())
+    let pad = (width as usize).saturating_sub(left.chars().count() + fixed);
+    let style = Style::new().bg(color).fg(Color::White).bold();
+    Line::from(vec![
+        Span::raw(format!("{left}{}", " ".repeat(pad))),
+        Span::styled(button, style.reversed()),
+        Span::raw(right),
+    ])
+    .style(style)
+}
+
+/// Footer columns `[from, to)` holding the copy button — flush left of the
+/// version corner. `None` when the footer is too narrow to carry both, in
+/// which case the button is neither drawn nor clickable.
+fn copy_button_x(width: u16) -> Option<(u16, u16)> {
+    let version = concat!("v", env!("CARGO_PKG_VERSION"), " ").chars().count() as u16;
+    let to = width.checked_sub(version)?;
+    let from = to.checked_sub(COPY_BUTTON.chars().count() as u16)?;
+    (from > 0).then_some((from, to))
 }
 
 /// First known agent process descending from `shell_pid`, with its spec.
@@ -1582,7 +1762,10 @@ fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'s
         Line::styled(path, parent_style),
         Line::from(process_row(parent, bar, parent_style, spin_style)),
     ];
-    // Two rows per subshell — path and process — bold while it is active.
+    // A replay row follows the process row whenever that shell is replayable.
+    lines.extend(replay_row(parent, bar, width, parent_style));
+    // Path + process rows per subshell (bold while active), each trailed by its
+    // own replay row when replayable.
     for (si, sub) in tab.shells.iter().enumerate().skip(1) {
         let s = if tab.active == si { style.bold() } else { style };
         let sfull =
@@ -1592,6 +1775,7 @@ fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'s
             s,
         ));
         lines.push(Line::from(process_row(sub, bar, s, spin_style)));
+        lines.extend(replay_row(sub, bar, width, s));
     }
     // Empty last row separating this tab from the next; on the active tab it
     // carries the `│` gutter like every other line.
@@ -1606,22 +1790,38 @@ fn process_row(shell: &Shell, bar: &str, style: Style, spin_style: Style) -> Vec
     // Braille spinner at 0.5 rps: one rotation per 2 s (10 frames × 200 ms).
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let mut row = vec![Span::styled(format!("{bar}   └ {}", shell.process), style)];
-    // Kata: a `replay` emoji next to the process name re-runs the shell's
-    // last command (mouse click or Alt+r) — only while a shell is the
-    // foreground process, never next to another program. It sits before the
-    // spinner so its click target never shifts as the spinner comes and goes;
-    // its column span must stay in sync with `App::replay_at`.
-    if shell.replayable() {
-        row.push(Span::styled(
-            format!("  {REPLAY_LABEL}"),
-            style.patch(Style::new().fg(REPLAY_COLOR)).bold(),
-        ));
-    }
     if shell.animating {
         let frame = (shell.spawned.elapsed().as_millis() / 200) as usize % FRAMES.len();
         row.push(Span::styled(format!("  {}", FRAMES[frame]), spin_style));
     }
     row
+}
+
+/// The `🔁 <command>` row shown directly below a shell's process row while a
+/// shell is the foreground process and has a command to replay (kata tab): the
+/// replay icon, then the full command that a click anywhere from the icon to the
+/// command's last column — or Alt+r — re-runs. `None` when the shell isn't
+/// replayable. The icon starts at `REPLAY_ICON_COL`, one space past the process
+/// row's `└`; the row's layout is kept in sync with `App::replay_at`.
+fn replay_row(shell: &Shell, bar: &str, width: u16, style: Style) -> Option<Line<'static>> {
+    if !shell.replayable() {
+        return None;
+    }
+    let cmd = shell.last_cmd.as_deref().unwrap_or_default();
+    Some(Line::from(vec![
+        Span::styled(format!("{bar}    {REPLAY_LABEL} "), style.patch(Style::new().fg(REPLAY_COLOR)).bold()),
+        Span::styled(truncate_head(cmd, width, REPLAY_PAD), style),
+    ]))
+}
+
+/// Clickable columns of a shell's replay row: the icon through the last column
+/// of the command text `replay_row` draws beside it (never narrower than the
+/// icon, so an empty command still leaves a button). Kept in sync with the
+/// layout in `replay_row`.
+fn replay_span(shell: &Shell, width: u16) -> std::ops::Range<usize> {
+    let cmd = shell.last_cmd.as_deref().unwrap_or_default();
+    let end = REPLAY_PAD as usize + truncate_head(cmd, width, REPLAY_PAD).chars().count();
+    REPLAY_ICON_COL..end.max(REPLAY_ICON_COL + REPLAY_COLS)
 }
 
 /// Final path component (the current folder); root-style paths show as-is.
@@ -1636,6 +1836,18 @@ fn truncate_tail(s: &str, width: u16, pad: u16) -> String {
     match s.char_indices().nth_back(max.saturating_sub(1)) {
         Some((cut, _)) if cut > 0 => format!("…{}", &s[cut..]),
         _ => s.to_string(),
+    }
+}
+
+/// Head-truncate `s` to the sidebar width, leaving `pad` columns for the prefix;
+/// an elided tail is marked with a trailing `…`. Commands read from the front,
+/// so — unlike a path — the head is what's kept.
+fn truncate_head(s: &str, width: u16, pad: u16) -> String {
+    let max = width.saturating_sub(pad) as usize;
+    if s.chars().count() > max {
+        s.chars().take(max.saturating_sub(1)).chain(std::iter::once('…')).collect()
+    } else {
+        s.to_string()
     }
 }
 
@@ -1660,7 +1872,11 @@ fn expand_home(path: &str) -> PathBuf {
 
 fn abbreviate_home(path: &str) -> String {
     match std::env::var("HOME") {
-        Ok(home) if path.starts_with(&home) => path.replacen(&home, "~", 1),
+        // Only an exact home or a `/`-bounded child abbreviates — a bare prefix
+        // match would fold a sibling like `/home/devops` into `~ops`.
+        Ok(home) if path == home || path.strip_prefix(&home).is_some_and(|r| r.starts_with('/')) => {
+            path.replacen(&home, "~", 1)
+        }
         _ => path.to_string(),
     }
 }
@@ -1791,6 +2007,12 @@ const REPLAY_LABEL: &str = "🔁";
 /// Terminal columns the replay emoji occupies — its clickable width (the emoji
 /// renders two cells wide, so a one-char span would miss its right half).
 const REPLAY_COLS: usize = 2;
+/// Columns the replay row spends before the command text: the gutter, a
+/// four-space indent, the two-cell icon, and a trailing space.
+const REPLAY_PAD: u16 = 8;
+/// First column of the replay icon — `{bar}    🔁` puts it one space past the
+/// process row's `└` (kept in sync with `replay_row`).
+const REPLAY_ICON_COL: usize = 5;
 
 fn hsl_rgb(h: f32, s: f32, l: f32) -> Color {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
@@ -1880,6 +2102,33 @@ fn selection_cells(a: (u16, u16), b: (u16, u16), cols: u16) -> Vec<(u16, u16)> {
         cells.extend((0..=b.1).map(|c| (b.0, c)));
     }
     cells
+}
+
+/// Put `text` on the clipboard by every route available, because no single one
+/// covers every host: OSC 52 is the only path that works over SSH and is what
+/// kitty/wezterm/foot/tmux honour, while VTE-based terminals (gnome-terminal,
+/// Tilix, Terminator — VTE has never implemented OSC 52 writes) drop it on the
+/// floor and are only reachable through the local X11/Wayland selection.
+/// Both are best-effort: a failing route never masks the other.
+fn copy_clipboard(text: &str) -> std::io::Result<()> {
+    let osc = copy_osc52(text);
+    if let Some(clipboard) = desktop_clipboard() {
+        let _ = clipboard.lock().unwrap_or_else(PoisonError::into_inner).set_text(text);
+    }
+    osc
+}
+
+/// The process-wide desktop clipboard, or `None` with no local display (plain
+/// SSH — OSC 52 carries the copy there). X11 hands the selection to a *live*
+/// owner, so the handle must outlive the copy: it is kept here for the life of
+/// the process, and pasting keeps working as long as ricon runs.
+fn desktop_clipboard() -> Option<&'static Mutex<arboard::Clipboard>> {
+    // Tests must not clobber the developer's real clipboard.
+    if cfg!(test) {
+        return None;
+    }
+    static CLIPBOARD: OnceLock<Option<Mutex<arboard::Clipboard>>> = OnceLock::new();
+    CLIPBOARD.get_or_init(|| arboard::Clipboard::new().ok().map(Mutex::new)).as_ref()
 }
 
 /// Push `text` to the host terminal's clipboard with an OSC 52 sequence,

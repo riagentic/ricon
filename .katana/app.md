@@ -55,7 +55,9 @@
 - active tab is persisted
 
 ## Shortcuts
-- Ctrl+q quits the app gracefully
+- Ctrl+q opens a centered confirmation dialog "Are you sure to Quit all tabs?" with YES and NO buttons
+- the quit dialog preselects NO; arrows toggle YES/NO, Enter confirms, Esc cancels — only YES quits the app gracefully
+- the quit dialog is modal: keys, mouse and paste don't reach the shells while it is open
 
 ## Tab
 - first row of the tab is current folder name 
@@ -91,4 +93,12 @@
 
 ## Replay button
 - when process is `bash` or any other shell, app captures last command that is typed and confirmed with Enter to save it as a command for replay. Replay perfors typing the same text into console and executing it with Enter
-- next to process name, there is emoji representing `replay` — shown (and clickable / Alt+r) only while the process is a shell; hidden while any other program is in the foreground
+- while a shell is the foreground process, a `replay` row sits just below the process row: the emoji, then the full command that will be replayed — the emoji is clickable / Alt+r; the whole row is hidden while any other program is in the foreground
+
+
+## Copy text to clipboard
+- text can be selected by mouse in a way that only terminal text is selected but not the tabs
+- selecting a range and releasing copies it to the host clipboard via OSC 52 — works over SSH; multi-line copies keep hard line breaks and rejoin soft-wrapped lines; trailing blank space is dropped
+- Shift+drag selects console text even over an app that grabbed the mouse (vim, less, htop); a plain drag there is still forwarded to that app unchanged
+- a brief "✓ copied" confirmation flashes in the footer after a copy
+
