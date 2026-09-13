@@ -8,12 +8,15 @@
 - can run at least one or multiple tabs
 - tabs are vertical 
 - tab states terminal number (starting by 1) and location (path) of the first shell
-- new shell can be triggered by ctrl+t or ctrl+n
+- new shell can be triggered by alt+t or alt+n
+- all shortcuts of ricon's own are on alt (alt+t/alt+n new tab, alt+w close shell, alt+f search, alt+shift+f favorite, alt+q quit, alt+s subshell, alt+r replay, alt+c copy mode, alt+a select all, alt+? help); ctrl keys are never taken from the shell
+- alt+? (or alt+h) shows a centered cheat sheet listing every shortcut; any key or click closes it and reaches nothing else
 - tab can be selected also by alt+terminal number (for example alt+1 and alt+KP 1)
 - terminal can be selected by clicking mouse on the tab 
 - next tab can be activated by alt+PgDown
 - previous tab can be activated by alt+PgUp
-- every terminal tab has different aesthetical colors
+- the active tab is painted in one soft pastel color with dark text; inactive tabs have no background of their own (the terminal's colors)
+- the status bar wears the same pastel as the active tab
 - terminal doesn't break functionality of any application running in it
 - app fills entire available space
 - app lives in existing terminal
@@ -37,9 +40,8 @@
 - first tab row shows current folder name, this is tab name
 - second tab row shows the location (full) path
 - third row of tab contains currently running process name
-- last row of the tab is empty separating the tabs 
-- if shell output changes, on third row after process name, white asci spinner indicating activity using brail code character rotated in 0.5 rps speed that lasts 1 seconds after and is removed after that is shown
-- fourth row is empty
+- last row of the tab separates the tabs: empty on an inactive tab; on the active tab it is an activity bar — a track across the panel with a lit segment sweeping left to right along it while any shell of the tab produces output (the same window as the spinner), the plain track while it is quiet
+- if shell output changes, on third row after process name, white asci spinner indicating activity using brail code character rotated in 0.5 rps speed that lasts 1 seconds after and is removed after that is shown (on the active tab's pastel the spinner takes the tab's dark text color, since white would vanish there)
 
 ## Shell information within the tab
 - in a multi-shell tab, the active shell's information (path, process) is bold (a single-shell tab is distinguished by the tab marker alone)
@@ -55,9 +57,12 @@
 - active tab is persisted
 
 ## Shortcuts
-- Ctrl+q opens a centered confirmation dialog "Are you sure to Quit all tabs?" with YES and NO buttons
+- Alt+c switches copy mode on / off (select console text over an app that owns the mouse)
+- Alt+a selects the whole visible screen and copies it
+- Alt+q opens a centered confirmation dialog "Are you sure to Quit all tabs?" with YES and NO buttons
 - the quit dialog preselects NO; arrows toggle YES/NO, Enter confirms, Esc cancels — only YES quits the app gracefully
 - the quit dialog is modal: keys, mouse and paste don't reach the shells while it is open
+- every ricon shortcut is a bare Alt chord: Ctrl+Alt chords (Emacs/readline C-M- bindings) and every Ctrl key reach the shell
 
 ## Tab
 - first row of the tab is current folder name 
@@ -79,11 +84,11 @@
 - navigation within one shell with shell can be done using Alt+Down or Atl+Up
 - each shell adds two rows to the tab showing path and running process
 - shell text is bold when it is the active shell among a tab's multiple shells
-- if tab has multiple hells, ctrl+w only closes active shell
+- if tab has multiple hells, Alt+w only closes active shell
 - subshells are persisted
 
 ## Favorites
-- tab can be marked and umarked as favorite using Alt+f
+- tab can be marked and umarked as favorite using Alt+Shift+f
 - when tab is marked as favorite, there is `⭐` added before tab name
 - when tab is marked as favorite it changes position and going on top after last existing favorite tab
 
@@ -99,6 +104,7 @@
 ## Copy text to clipboard
 - text can be selected by mouse in a way that only terminal text is selected but not the tabs
 - selecting a range and releasing copies it to the host clipboard via OSC 52 — works over SSH; multi-line copies keep hard line breaks and rejoin soft-wrapped lines; trailing blank space is dropped
-- Shift+drag selects console text even over an app that grabbed the mouse (vim, less, htop); a plain drag there is still forwarded to that app unchanged
+- double-click copies the word under the cursor, triple-click the whole line, Alt+a the whole visible screen
+- copy mode (the status-bar button, or Alt+c) selects console text even over an app that grabbed the mouse (a coding agent, vim, less, htop); with it off, Alt+drag does the same in one gesture and a plain drag is forwarded to that app unchanged
 - a brief "✓ copied" confirmation flashes in the footer after a copy
 
