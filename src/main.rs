@@ -1,7 +1,8 @@
 //! ricon — a console with vertical tabs (ratatui + portable-pty + vt100).
 
 use std::{
-    cell::Cell,
+    cell::{Cell, OnceCell, RefCell},
+    collections::HashMap,
     error::Error,
     hash::{DefaultHasher, Hash, Hasher},
     io::{ErrorKind, Read, Write},
@@ -274,6 +275,17 @@ struct Shell {
     last_input: Instant,
     /// When a due nudge last read whether its agent holds the tty.
     tty_checked: Cell<Instant>,
+    /// The scrollback offset ricon last set, and how many rows the text moved
+    /// up by while scrolled back before that — see `content_shift`.
+    view_set: Cell<usize>,
+    shifted: Cell<isize>,
+    /// Characters typed into this shell since the last Enter, as far as the
+    /// keys tell (see `draft_after`): a message still being written in an
+    /// agent's composer, which a nudge must never be appended to and sent with.
+    draft: usize,
+    /// When `draft` last grew — a client reporting idle since then has taken
+    /// the text, however it was sent.
+    drafted: Instant,
     /// When the context usage last triggered a compaction — see
     /// `CONTEXT_COMPACT_EVERY`.
     context_compacted: Option<Instant>,
@@ -470,7 +482,7 @@ impl Shell {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        feed.lock().unwrap_or_else(PoisonError::into_inner).process(&buf[..n]);
+                        tap.process(&mut feed.lock().unwrap_or_else(PoisonError::into_inner), &buf[..n]);
                         // Commit what these bytes just finished drawing (a no-op
                         // unless this shell is being transcribed).
                         tap.pump(&feed, Pump::Output);
@@ -531,6 +543,10 @@ impl Shell {
             // Nobody has typed here yet: the other clocks bound the wait.
             last_input: stale(IDLE_NUDGE),
             tty_checked: Cell::new(stale(SAMPLE_EVERY)),
+            view_set: Cell::new(0),
+            shifted: Cell::new(0),
+            draft: 0,
+            drafted: stale(IDLE_NUDGE),
             context_compacted: None,
             pinged: false,
             agent: None,
@@ -793,6 +809,28 @@ impl Shell {
         }
     }
 
+    /// Is a message still being written in the agent's composer? Yes while
+    /// keys typed since the last Enter left text behind — unless the client has
+    /// reported idle since, which means it took the text however it was sent.
+    fn draft_pending(&self) -> bool {
+        let sent = |since: SystemTime| {
+            SystemTime::now().checked_sub(self.drafted.elapsed()).is_some_and(|drafted| drafted < since)
+        };
+        self.draft > 0
+            && !self
+                .agent
+                .as_ref()
+                .and_then(|a| a.status)
+                .is_some_and(|s| matches!(s, Status::Idle(since) if sent(since)))
+    }
+
+    /// Waiting long enough to count down, but held by an unsent draft — what
+    /// the footer shows instead of the countdown, so the pause is never a
+    /// mystery.
+    fn held_by_draft(&self) -> bool {
+        self.draft_pending() && self.idle_for().is_some_and(|idle| idle >= COUNTDOWN_FROM)
+    }
+
     /// May a due nudge read the tty owner now? At most every `SAMPLE_EVERY`.
     fn tty_check_due(&self) -> bool {
         let due = self.tty_checked.get().elapsed() >= SAMPLE_EVERY;
@@ -806,7 +844,7 @@ impl Shell {
     /// `CONTEXT_COMPACT_AT`, after the short one, so the agent is compacted
     /// before it runs out of room rather than after it has been waiting.
     fn nudge_due(&self) -> bool {
-        let Some(idle) = self.idle_for() else { return false };
+        let Some(idle) = self.idle_for().filter(|_| !self.draft_pending()) else { return false };
         idle >= IDLE_NUDGE
             || (self.context_full() && idle >= CONTEXT_SETTLE && self.context_compact_allowed())
     }
@@ -862,7 +900,7 @@ impl Shell {
     /// stretch is long enough to be worth showing (kata ai.md: the countdown
     /// in the footer). `None` while busy, mid-nudge, or too early.
     fn countdown(&self) -> Option<Duration> {
-        let idle = self.idle_for().filter(|_| self.nudge.is_none())?;
+        let idle = self.idle_for().filter(|_| self.nudge.is_none() && !self.draft_pending())?;
         let due =
             if self.context_full() && self.context_compact_allowed() { CONTEXT_SETTLE } else { IDLE_NUDGE };
         (idle >= COUNTDOWN_FROM.min(due)).then(|| due.saturating_sub(idle))
@@ -1011,9 +1049,82 @@ impl Shell {
         let mut parser = self.parser.lock().unwrap_or_else(PoisonError::into_inner);
         let screen = parser.screen_mut();
         let before = screen.scrollback();
+        self.shifted.set(self.shifted.get() + before as isize - self.view_set.get() as isize);
         let at = if delta == 0 { 0 } else { (before as isize + delta).max(0) as usize };
         screen.set_scrollback(at);
+        self.view_set.set(screen.scrollback());
         screen.scrollback() as isize - before as isize
+    }
+
+    /// The scrollback offset the pane shows.
+    fn view(&self) -> usize {
+        self.parser.lock().unwrap_or_else(PoisonError::into_inner).screen().scrollback()
+    }
+
+    /// How many rows the text has moved up by, as far as the view tells: while
+    /// scrolled back, the emulator pins the view to the text by raising the
+    /// offset one row per line that scrolls in, so every rise ricon did not
+    /// make itself is text moving. At the live view nothing pins it, and the
+    /// text runs under a still selection, as in any terminal.
+    fn content_shift(&self) -> isize {
+        self.shifted.get() + self.view() as isize - self.view_set.get() as isize
+    }
+
+    /// Text between two positions, `to` exclusive, in reading order — rows
+    /// joined by a newline unless the terminal soft-wrapped them, as
+    /// `contents_between` does, but reaching into the scrollback.
+    fn text_between(&self, from: Pos, to: Pos) -> String {
+        self.read_rows(from.0, to.0, |screen, row, visible, cols| {
+            let start = if row == from.0 { from.1 } else { 0 };
+            let end = if row == to.0 { to.1.min(cols) } else { cols };
+            let mut text = if start < end {
+                screen.rows(start, end - start).nth(visible).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if row != to.0 && !screen.row_wrapped(visible as u16) {
+                text.push('\n');
+            }
+            text
+        })
+    }
+
+    /// Text of the rectangle between two corners (inclusive): each row's
+    /// columns, trailing blanks dropped, joined by newlines.
+    fn block_between(&self, from: Pos, to: Pos) -> String {
+        let (top, bottom) = corners(from, to);
+        let mut first = true;
+        self.read_rows(top.0, bottom.0, |screen, _, visible, cols| {
+            let width = (bottom.1 + 1).min(cols).saturating_sub(top.1);
+            let row = screen.rows(top.1, width).nth(visible).unwrap_or_default();
+            let sep = if std::mem::replace(&mut first, false) { "" } else { "\n" };
+            format!("{sep}{}", row.trim_end())
+        })
+    }
+
+    /// `read(screen, row, visible row, cols)` for every text row from `first`
+    /// to `last` that still exists, concatenated. The view is moved to bring
+    /// each row on screen and put back before the lock is released.
+    fn read_rows(
+        &self,
+        first: isize,
+        last: isize,
+        mut read: impl FnMut(&vt100::Screen, isize, usize, u16) -> String,
+    ) -> String {
+        let mut parser = self.parser.lock().unwrap_or_else(PoisonError::into_inner);
+        let screen = parser.screen_mut();
+        let (rows, cols) = screen.size();
+        let view = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let history = screen.scrollback() as isize;
+        let mut out = String::new();
+        for row in first.max(-history)..=last.min(rows as isize - 1) {
+            // A scrollback row is the top of the view scrolled back to it.
+            screen.set_scrollback(row.min(0).unsigned_abs());
+            out.push_str(&read(screen, row, row.max(0) as usize, cols));
+        }
+        screen.set_scrollback(view);
+        out
     }
 
     /// Snapshot of the input-relevant terminal modes the inner app has set.
@@ -1123,14 +1234,24 @@ struct TermModes {
     mouse_encoding: MouseProtocolEncoding,
 }
 
-/// A live text selection in the terminal pane. Coordinates are visible-grid
-/// (row, col) cells; `shell` binds the selection to the tab+shell it was made
-/// in, so it is only drawn (and copied) while that shell is on screen.
+/// A position in a shell's text: the row counted from the top of the live
+/// screen (negative rows are in the scrollback), and the column.
+type Pos = (isize, u16);
+
+/// A live text selection in the terminal pane. Its ends are `Pos`itions in the
+/// shell's text, not screen cells, so scrolling moves the view over a
+/// selection instead of the selection itself — it can span any number of
+/// screenfuls, and what is scrolled out of view is still selected. `shell`
+/// binds it to the tab+shell it was made in, so it is only drawn (and copied)
+/// while that shell is on screen.
 #[derive(Clone)]
 struct Selection {
     shell: (usize, usize),
-    anchor: (u16, u16),
-    head: (u16, u16),
+    anchor: Pos,
+    head: Pos,
+    /// The shell's `content_shift` the ends were last expressed against: text
+    /// that moves up while the view is scrolled back takes the selection along.
+    shift: isize,
     /// True while the left button is held — drag extends `head`; release copies.
     dragging: bool,
     /// Block (rectangular) selection: every cell in the rectangle between
@@ -1168,17 +1289,7 @@ impl AgentProbe {
         let (reply, answers) = mpsc::channel();
         thread::spawn(move || {
             while let Ok(shell) = requests.recv() {
-                let model = detect_agent(shell).map(|(spec, pid)| AgentInfo {
-                    name: spec.comm,
-                    model: spec
-                        .sources
-                        .iter()
-                        .find_map(|src| resolve_source(src, pid))
-                        .unwrap_or_else(|| spec.comm.to_string()),
-                    pid,
-                    context: resolve_usage(&spec.usage, pid),
-                    status: resolve_status(&spec.usage, pid),
-                });
+                let model = detect_agent(shell).map(|(spec, pid)| Probe::new(pid).agent(spec));
                 if reply.send((shell, model)).is_err() {
                     break;
                 }
@@ -1513,6 +1624,7 @@ impl App {
     }
 
     fn handle(&mut self, event: Event) -> Result<(), Box<dyn Error>> {
+        self.sync_selection();
         let handled = match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
             Event::Mouse(mouse) => self.on_mouse(mouse),
@@ -1899,12 +2011,17 @@ impl App {
         // to the pane grid) and copy to the clipboard on release. A release with
         // no movement is a plain click, which just clears the selection.
         let (sw, pr, pc) = (self.sidebar_width, self.pty_rows, self.pty_cols);
+        let dragged = (self.selection.as_ref().is_some_and(|sel| sel.dragging)
+            && matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)))
+        .then(|| {
+            self.pos_at((
+                mouse.row.min(pr.saturating_sub(1)),
+                mouse.column.saturating_sub(sw).min(pc.saturating_sub(1)),
+            ))
+        });
         match (self.selection.as_mut(), mouse.kind) {
-            (Some(sel), MouseEventKind::Drag(MouseButton::Left)) if sel.dragging => {
-                sel.head = (
-                    mouse.row.min(pr.saturating_sub(1)),
-                    mouse.column.saturating_sub(sw).min(pc.saturating_sub(1)),
-                );
+            (Some(sel), MouseEventKind::Drag(MouseButton::Left)) if let Some(head) = dragged => {
+                sel.head = head;
                 // Shift+Ctrl held through the drag makes it a block selection;
                 // the flag is read live so the user can switch mid-gesture.
                 sel.block = mouse.modifiers.contains(KeyModifiers::SHIFT)
@@ -2070,10 +2187,12 @@ impl App {
                             _ => {
                                 let block = mouse.modifiers.contains(KeyModifiers::SHIFT)
                                     && mouse.modifiers.contains(KeyModifiers::CONTROL);
+                                let pos = self.pos_at(cell);
                                 self.selection = Some(Selection {
                                     shell,
-                                    anchor: cell,
-                                    head: cell,
+                                    anchor: pos,
+                                    head: pos,
+                                    shift: self.tabs[self.active].active_shell().content_shift(),
                                     dragging: true,
                                     block,
                                     text: None,
@@ -2105,34 +2224,10 @@ impl App {
         Ok(())
     }
 
-    /// Scroll the active pane and carry a live selection along with the text it
-    /// covers; the part scrolled out of view is let go (the grid is all a
-    /// selection addresses), and the whole of it once none is left in view.
+    /// Scroll the active pane. A selection stays on its text (its ends are
+    /// text positions), wherever the view goes.
     fn scroll_pane(&mut self, delta: isize) {
-        let moved = self.tabs[self.active].active_shell().scroll(delta);
-        let (rows, last_col) = (self.pty_rows as isize, self.pty_cols.saturating_sub(1));
-        if moved == 0 {
-            return;
-        }
-        if let Some(sel) = self.selection.as_ref() {
-            let (anchor, head) = (sel.anchor.0 as isize + moved, sel.head.0 as isize + moved);
-            let gone = |r: isize| r < 0 || r >= rows;
-            // An endpoint pushed past an edge pins to that edge's far corner —
-            // keeping its column would cut the rows it still covers short.
-            let pin = |r: isize, col: u16| match r {
-                _ if r < 0 => (0, 0),
-                _ if r >= rows => ((rows - 1) as u16, last_col),
-                _ => (r as u16, col),
-            };
-            self.selection = (!(gone(anchor) && gone(head))).then(|| Selection {
-                anchor: pin(anchor, sel.anchor.1),
-                head: pin(head, sel.head.1),
-                // The coordinates moved, so a finalized snapshot no longer
-                // matches them — drop it and re-read the live screen on copy.
-                text: None,
-                ..sel.clone()
-            });
-        }
+        self.tabs[self.active].active_shell().scroll(delta);
     }
 
     /// Position of this click in a double/triple-click chain (1, 2 or 3):
@@ -2146,6 +2241,27 @@ impl App {
         };
         self.last_click = Some((now, cell, count));
         count
+    }
+
+    /// The text position under pane cell `cell` of the active shell's view.
+    fn pos_at(&self, cell: (u16, u16)) -> Pos {
+        (cell.0 as isize - self.tabs[self.active].active_shell().view() as isize, cell.1)
+    }
+
+    /// Carry the selection along with text that moved under a scrolled-back
+    /// view since it was last looked at (see `Shell::content_shift`).
+    fn sync_selection(&mut self) {
+        let Some(sel) = self.selection.as_mut() else { return };
+        let Some(shell) = self.tabs.get(sel.shell.0).and_then(|tab| tab.shells.get(sel.shell.1)) else {
+            return;
+        };
+        let shift = shell.content_shift();
+        let moved = shift - sel.shift;
+        if moved != 0 {
+            sel.anchor.0 -= moved;
+            sel.head.0 -= moved;
+            sel.shift = shift;
+        }
     }
 
     /// Grid span of the word under `cell` (double click).
@@ -2323,11 +2439,7 @@ impl App {
         let (t, s) = sel.shell;
         let shell = self.tabs.get(t).and_then(|tab| tab.shells.get(s))?;
         let (a, b) = order(sel.anchor, sel.head);
-        let text = if sel.block {
-            block_text(shell, a, b, self.pty_cols)
-        } else {
-            shell.screen_between(a, (b.0, (b.1 + 1).min(self.pty_cols)))
-        };
+        let text = if sel.block { shell.block_between(a, b) } else { shell.text_between(a, (b.0, b.1 + 1)) };
         let text = text.trim_end().to_string();
         (!text.is_empty()).then_some(text)
     }
@@ -2354,7 +2466,9 @@ impl App {
     /// Select `span` outright (double/triple click, Alt+a) and copy it. The
     /// selection stays on screen, so what landed on the clipboard is visible.
     fn select_span(&mut self, shell: (usize, usize), (anchor, head): ((u16, u16), (u16, u16))) {
-        let sel = Selection { shell, anchor, head, dragging: false, block: false, text: None };
+        let (anchor, head) = (self.pos_at(anchor), self.pos_at(head));
+        let shift = self.tabs[self.active].active_shell().content_shift();
+        let sel = Selection { shell, anchor, head, shift, dragging: false, block: false, text: None };
         // Snapshot the text now so the copy is exactly the highlight even if
         // the inner app repaints before the clipboard write lands.
         let text = self.selection_text(sel.clone());
@@ -2403,12 +2517,13 @@ impl App {
     fn write_active(&mut self, bytes: &[u8]) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let shell = tab.active_shell_mut();
-        // Any input snaps the view back to live output — a selection made on
-        // the scrolled view would then highlight unrelated text.
-        if shell.scroll(0) != 0 {
-            self.selection = None;
-        }
+        shell.scroll(0); // any input snaps the view back to live output
         shell.last_input = Instant::now(); // the user is here: a nudge waits
+        let draft = draft_after(shell.draft, bytes);
+        if draft > shell.draft {
+            shell.drafted = Instant::now();
+        }
+        shell.draft = draft;
         shell.note_input(bytes); // capture the typed command for `replay`, off the live view
         shell.send(bytes);
     }
@@ -2490,6 +2605,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.shown[visible].iter().map(|&i| tab_item(i, &app.tabs[i], i == app.active, app.sidebar_width));
     frame.render_widget(List::new(items), list_area);
 
+    app.sync_selection();
     if app.active < app.tabs.len() {
         let cwd = app.tabs[app.active].active_shell().cwd.clone();
         let branch = app.git_branch_cached(cwd.as_deref());
@@ -2501,14 +2617,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
         // outright rather than reversed: reversing cancels itself out over text
         // that is already inverse (prompts, status lines, a selected menu row),
         // which left holes in the highlight exactly where it mattered.
-        if let Some(sel) = app.selection.as_ref().filter(|s| s.shell == (app.active, tab.active)) {
-            let (a, b) = order(sel.anchor, sel.head);
+        if let Some(sel) = app.selection.as_ref().filter(|s| s.shell == (app.active, tab.active))
+            && let Some(cells) =
+                visible_selection(sel, parser.screen().scrollback(), app.pty_rows, app.pty_cols)
+        {
             let buf = frame.buffer_mut();
-            let cells: Box<dyn Iterator<Item = (u16, u16)>> = if sel.block {
-                Box::new(block_cells(a, b))
-            } else {
-                Box::new(selection_cells(a, b, app.pty_cols))
-            };
             for (r, c) in cells {
                 if r < pane.height
                     && c < pane.width
@@ -2660,6 +2773,7 @@ fn status_bar(f: Footer) -> Line<'static> {
         Some(Nudge::Continued(_)) => " ⟳".to_string(),
         None => match shell.countdown().filter(|_| auto) {
             Some(left) => format!(" ⏳ {} → {COMPACT_COMMAND}", clock(left)),
+            None if auto && shell.held_by_draft() => format!(" {DRAFT_HOLD}"),
             None => String::new(),
         },
     };
@@ -2824,16 +2938,261 @@ fn foreground_pid(shell: u32) -> Option<u32> {
     (tpgid > 0 && tpgid as u32 != shell).then_some(tpgid as u32)
 }
 
-/// Resolve a model name from a single source, reading agent process `pid`.
-fn resolve_source(src: &Source, pid: u32) -> Option<String> {
-    match src {
-        Source::Settings(rel, key) => settings_value(rel, key),
-        Source::EnvJson(var, key) => env_var(pid, var).and_then(|json| json_string(&json, key)),
-        Source::EnvPlain(var) => env_var(pid, var),
-        Source::LogTail(dir, key) => log_tail_value(dir, key),
-        Source::SessionTail(dir) => session_tail_model(dir, pid),
-        Source::OpencodeSelected => opencode_selected(pid),
+/// One agent's facts, gathered for one probe. The model, the context usage
+/// and the status all come out of the same few sources — the agent's cwd and
+/// environment, its client's registration and settings, the session
+/// transcript's tail, opencode's store — so each is read at most once here,
+/// however many of the answers need it.
+struct Probe {
+    pid: u32,
+    home: Option<PathBuf>,
+    cwd: OnceCell<Option<PathBuf>>,
+    environ: OnceCell<Vec<u8>>,
+    /// `$HOME`-relative files read so far (settings, registrations).
+    files: RefCell<HashMap<String, Option<String>>>,
+    /// The session transcript this agent writes, per client directory.
+    session: OnceCell<Option<PathBuf>>,
+    /// The widest transcript tail read so far: its size and its whole lines.
+    tail: RefCell<Option<(u64, String)>>,
+    opencode: OnceCell<Option<(String, String)>>,
+    db: OnceCell<Option<rusqlite::Connection>>,
+}
+
+impl Probe {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            cwd: OnceCell::new(),
+            environ: OnceCell::new(),
+            files: RefCell::new(HashMap::new()),
+            session: OnceCell::new(),
+            tail: RefCell::new(None),
+            opencode: OnceCell::new(),
+            db: OnceCell::new(),
+        }
     }
+
+    /// Everything the status bar and the auto feature want to know about the
+    /// agent `spec` names, running as this probe's pid.
+    fn agent(&self, spec: &'static AgentSpec) -> AgentInfo {
+        AgentInfo {
+            name: spec.comm,
+            model: spec
+                .sources
+                .iter()
+                .find_map(|src| self.source(src))
+                .unwrap_or_else(|| spec.comm.to_string()),
+            pid: self.pid,
+            context: self.usage(&spec.usage),
+            status: self.status(&spec.usage),
+        }
+    }
+
+    /// The agent process's working directory.
+    fn cwd(&self) -> Option<&Path> {
+        self.cwd.get_or_init(|| std::fs::read_link(format!("/proc/{}/cwd", self.pid)).ok()).as_deref()
+    }
+
+    /// Value of env var `var` in the agent process.
+    fn env(&self, var: &str) -> Option<String> {
+        let environ = self
+            .environ
+            .get_or_init(|| std::fs::read(format!("/proc/{}/environ", self.pid)).unwrap_or_default());
+        let prefix = format!("{var}=");
+        environ
+            .split(|b| *b == 0)
+            .filter_map(|kv| std::str::from_utf8(kv).ok())
+            .find_map(|kv| kv.strip_prefix(&prefix).map(str::to_string))
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Text of the `$HOME`-relative file `rel`.
+    fn file(&self, rel: &str) -> Option<String> {
+        let mut files = self.files.borrow_mut();
+        files
+            .entry(rel.to_string())
+            .or_insert_with(|| std::fs::read_to_string(self.home.as_ref()?.join(rel)).ok())
+            .clone()
+    }
+
+    /// String value for `key` in the `$HOME`-relative JSON file `rel`.
+    fn setting(&self, rel: &str, key: &str) -> Option<String> {
+        json_string(&self.file(rel)?, key)
+    }
+
+    /// The client's registration of this process: `<base>/sessions/<pid>.json`.
+    fn registration(&self, dir: &str) -> Option<String> {
+        self.file(&format!("{}/sessions/{}.json", client_base(dir), self.pid))
+    }
+
+    /// Resolve a model name from a single source.
+    fn source(&self, src: &Source) -> Option<String> {
+        match src {
+            Source::Settings(rel, key) => self.setting(rel, key),
+            Source::EnvJson(var, key) => self.env(var).and_then(|json| json_string(&json, key)),
+            Source::EnvPlain(var) => self.env(var),
+            Source::LogTail(dir, key) => log_tail_value(dir, key),
+            Source::SessionTail(dir) => self.session_model(dir),
+            Source::OpencodeSelected => json_string(&self.opencode_session()?.1, "id"),
+        }
+    }
+
+    /// Resolve an agent's context usage from where its client keeps it.
+    fn usage(&self, usage: &Usage) -> Option<Context> {
+        match usage {
+            Usage::ClaudeSession(dir) => self.session_context(dir),
+            Usage::Opencode => self.opencode_context(),
+        }
+    }
+
+    /// The agent's own status, where its client reports one: Claude Code keeps
+    /// `status` (`idle`, `busy`, `shell`…) and `statusUpdatedAt` (ms since the
+    /// epoch) in its registration. Anything but `idle` is busy; opencode
+    /// reports nothing, and the screen hash stands in.
+    fn status(&self, usage: &Usage) -> Option<Status> {
+        let Usage::ClaudeSession(dir) = usage else { return None };
+        session_status(&self.registration(dir)?)
+    }
+
+    /// Model of the session transcript this agent is writing. Every assistant
+    /// line in it carries the model that answered, so the last one is the
+    /// model in force right now, `/model` switches included.
+    fn session_model(&self, dir: &str) -> Option<String> {
+        self.session_tail(dir, last_session_model)
+    }
+
+    /// Context usage of that same session: what its last answer was billed for
+    /// as input, and the window it sits in.
+    fn session_context(&self, dir: &str) -> Option<Context> {
+        let used = self.session_tail(dir, last_session_usage)?;
+        // The window is the model's, and Claude Code names the wide one with a
+        // `[1m]` suffix on the model it was configured with — a suffix the
+        // transcript strips — whether in the env, the settings or a `--model`
+        // on the command line. A usage past the narrow window is proof of the
+        // wide one whatever the configuration says.
+        let configured = self
+            .env("ANTHROPIC_MODEL")
+            .or_else(|| self.setting(&format!("{}/settings.json", client_base(dir)), "model"))
+            .unwrap_or_default();
+        let launched = proc_cmdline(self.pid).is_some_and(|cmd| cmd.contains("[1m]"));
+        let wide = launched || configured.contains("[1m]") || used > CONTEXT_WINDOW;
+        Some(Context { used, max: Some(if wide { WIDE_CONTEXT_WINDOW } else { CONTEXT_WINDOW }) })
+    }
+
+    /// The session transcript this agent is writing, under `<$HOME>/<dir>/<slug>`
+    /// where `slug` is the agent's working directory with every
+    /// non-alphanumeric character replaced by `-` — how Claude Code and its
+    /// forks name a project's transcript folder. Which file in that folder is
+    /// *this* session's: the client registers itself with its session id, and
+    /// the transcript is named by that id — so two sessions open in the same
+    /// project each resolve to their own. A client that registers nothing (an
+    /// older version, a fork) falls back to the newest transcript in the folder.
+    fn session_file(&self, dir: &str) -> Option<&Path> {
+        self.session
+            .get_or_init(|| {
+                let slug: String = self
+                    .cwd()?
+                    .to_str()?
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                    .collect();
+                let project = self.home.as_ref()?.join(dir).join(slug);
+                // A registered session is the only answer, even before its
+                // transcript exists (a new session, or just after `/clear`): the
+                // newest file then belongs to another session.
+                match self.registration(dir).and_then(|json| json_string(&json, "sessionId")) {
+                    Some(id) => Some(project.join(format!("{id}.jsonl"))).filter(|file| file.is_file()),
+                    None => newest_file(&project, "jsonl"),
+                }
+            })
+            .as_deref()
+    }
+
+    /// `find` over the session transcript's tail, widened until it answers
+    /// (see `TAILS`). The widest window read is kept, and a narrower one is
+    /// never read after it: the finders look for the *last* matching line, so
+    /// a wider window gives the same answer.
+    fn session_tail<T>(&self, dir: &str, find: impl Fn(&str) -> Option<T>) -> Option<T> {
+        let path = self.session_file(dir)?;
+        let len = std::fs::metadata(path).ok()?.len();
+        let mut cached = self.tail.borrow_mut();
+        TAILS.iter().find_map(|&max| {
+            if cached.as_ref().is_none_or(|(read, _)| *read < max.min(len)) {
+                *cached = Some((max.min(len), tail_lines(path, max, len)?));
+            }
+            let (_, text) = cached.as_ref()?;
+            // Past the whole file, a wider read would find nothing new: stop.
+            find(text).map(Some).or_else(|| (len <= max).then_some(None))
+        })?
+    }
+
+    /// opencode's most recently used session for the agent's project dir: its
+    /// id and its model (a JSON blob with the provider and model ids).
+    /// opencode is event-sourced into a SQLite DB; the live selection is the
+    /// model of the most recently updated `session` row for that directory.
+    /// Reading it via SQLite (vs. scanning bytes) is essential — WAL frame
+    /// ordering makes raw scans return stale models.
+    fn opencode_session(&self) -> Option<&(String, String)> {
+        self.opencode
+            .get_or_init(|| {
+                self.db()?
+                    .query_row(
+                        "SELECT id, model FROM session \
+                         WHERE directory = ?1 AND model IS NOT NULL \
+                         ORDER BY time_updated DESC LIMIT 1",
+                        [self.cwd()?.to_str()?],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    /// opencode's context usage for the agent's session: the token total of the
+    /// last finished answer in it (the conversation as the model saw it),
+    /// against the model's context limit from opencode's own model catalog —
+    /// left out when the catalog has no entry for it.
+    fn opencode_context(&self) -> Option<Context> {
+        let (session, model) = self.opencode_session()?;
+        // The answer still streaming has no total yet (0), and reading it made
+        // the footer flicker to nothing on every probe.
+        let used: u64 = self
+            .db()?
+            .query_row(
+                "SELECT json_extract(data, '$.tokens.total') FROM message \
+                 WHERE session_id = ?1 AND json_extract(data, '$.role') = 'assistant' \
+                   AND json_extract(data, '$.tokens.total') > 0 \
+                 ORDER BY time_updated DESC LIMIT 1",
+                [session],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let max = json_string(model, "providerID")
+            .zip(json_string(model, "id"))
+            .and_then(|(provider, id)| opencode_context_limit(&provider, &id));
+        Some(Context { used, max })
+    }
+
+    /// opencode's database, opened once per probe and read-only, so opencode
+    /// is never disturbed.
+    fn db(&self) -> Option<&rusqlite::Connection> {
+        use rusqlite::{Connection, OpenFlags};
+        self.db
+            .get_or_init(|| {
+                let path = self.home.as_ref()?.join(".local/share/opencode/opencode.db");
+                let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+                let _ = conn.busy_timeout(Duration::from_millis(100));
+                Some(conn)
+            })
+            .as_ref()
+    }
+}
+
+/// The client's config directory for its `projects` dir: `.claude` for
+/// `.claude/projects`.
+fn client_base(dir: &str) -> &str {
+    Path::new(dir).parent().and_then(Path::to_str).unwrap_or_default()
 }
 
 /// Most recently modified `*.<ext>` file directly under `dir`.
@@ -2847,81 +3206,26 @@ fn newest_file(dir: &Path, ext: &str) -> Option<PathBuf> {
         .map(|(_, p)| p)
 }
 
-/// Model of the session transcript agent `pid` is writing (see `session_file`).
-/// Every assistant line in that JSONL carries the model that answered, so the
-/// last one is the model in force right now, `/model` switches included. Only
-/// the file's tail is read, and the whole probe runs off the render thread
-/// (see `AgentProbe`).
-fn session_tail_model(dir: &str, pid: u32) -> Option<String> {
-    scan_tail(&session_file(dir, pid)?, last_session_model)
-}
-
-/// Context usage of that same session: what its last answer was billed for as
-/// input, and the window it sits in.
-fn session_context(dir: &str, pid: u32) -> Option<Context> {
-    let used = scan_tail(&session_file(dir, pid)?, last_session_usage)?;
-    // The window is the model's, and Claude Code names the wide one with a
-    // `[1m]` suffix on the model it was configured with — a suffix the
-    // transcript strips. A usage past the narrow window is proof of the wide
-    // one whatever the configuration says.
-    let base = Path::new(dir).parent().and_then(Path::to_str).unwrap_or_default();
-    let configured = env_var(pid, "ANTHROPIC_MODEL")
-        .or_else(|| settings_value(&format!("{base}/settings.json"), "model"))
-        .unwrap_or_default();
-    // A `--model …[1m]` on the command line outranks both.
-    let launched = proc_cmdline(pid).is_some_and(|cmd| cmd.contains("[1m]"));
-    let wide = launched || configured.contains("[1m]") || used > CONTEXT_WINDOW;
-    Some(Context { used, max: Some(if wide { WIDE_CONTEXT_WINDOW } else { CONTEXT_WINDOW }) })
-}
-
 /// Claude Code's context windows: the default, and the one a `[1m]` model
 /// carries.
 const CONTEXT_WINDOW: u64 = 200_000;
 const WIDE_CONTEXT_WINDOW: u64 = 1_000_000;
 
-/// `find` over the tail of `path`, widened until it answers. Transcript lines
-/// are unbounded — one tool result can be a few hundred KiB — so a fixed tail
-/// can hold nothing but the line written after the answer being looked for.
-/// The line the tail starts inside is dropped: it is not whole, and a cut
-/// line can lose the very marker (`isSidechain`) that disqualifies it.
-fn scan_tail<T>(path: &Path, find: impl Fn(&str) -> Option<T>) -> Option<T> {
-    const TAILS: [u64; 3] = [64 * 1024, 1024 * 1024, 8 * 1024 * 1024];
-    let len = std::fs::metadata(path).ok()?.len();
-    TAILS.iter().find_map(|&max| {
-        let bytes = read_tail(path, max)?;
-        let text = String::from_utf8_lossy(&bytes);
-        let whole = if len > max { text.split_once('\n').map_or("", |(_, rest)| rest) } else { &text };
-        // Past the whole file, a wider read would find nothing new: stop.
-        find(whole).map(Some).or_else(|| (len <= max).then_some(None))
-    })?
-}
+/// Transcript tails, narrowest first. Transcript lines are unbounded — one
+/// tool result can be a few hundred KiB — so a fixed tail can hold nothing but
+/// the line written after the answer being looked for.
+const TAILS: [u64; 3] = [64 * 1024, 1024 * 1024, 8 * 1024 * 1024];
 
-/// The session transcript agent `pid` is writing, under `<$HOME>/<dir>/<slug>`
-/// where `slug` is the agent process's own working directory with every
-/// non-alphanumeric character replaced by `-` — how Claude Code and its forks
-/// name a project's transcript folder. Which file in that folder is *this*
-/// session's: the client registers itself under `<$HOME>/<base>/sessions/<pid>.json`
-/// with its session id, and the transcript is named by that id — so two
-/// sessions open in the same project each resolve to their own. A client that
-/// registers nothing (an older version, a fork) falls back to the newest
-/// transcript in the folder.
-fn session_file(dir: &str, pid: u32) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-    let slug: String =
-        cwd.to_str()?.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    let project = PathBuf::from(format!("{home}/{dir}/{slug}"));
-    let base = Path::new(dir).parent().and_then(Path::to_str).unwrap_or_default();
-    let registered = std::fs::read_to_string(format!("{home}/{base}/sessions/{pid}.json"))
-        .ok()
-        .and_then(|json| json_string(&json, "sessionId"));
-    // A registered session is the only answer, even before its transcript
-    // exists (a new session, or just after `/clear`): the newest file then
-    // belongs to another session, and its model and usage are not this one's.
-    match registered {
-        Some(id) => Some(project.join(format!("{id}.jsonl"))).filter(|file| file.is_file()),
-        None => newest_file(&project, "jsonl"),
-    }
+/// The whole lines in the last `max` bytes of `path`, a file `len` bytes long.
+/// The line the window starts inside is dropped: it is not whole, and a cut
+/// line can lose the very marker (`isSidechain`) that disqualifies it.
+fn tail_lines(path: &Path, max: u64, len: u64) -> Option<String> {
+    let text = String::from_utf8_lossy(&read_tail(path, max)?).into_owned();
+    Some(if len > max {
+        text.split_once('\n').map_or_else(String::new, |(_, rest)| rest.to_string())
+    } else {
+        text
+    })
 }
 
 /// The model of the last main-session answer in a transcript tail: one JSON
@@ -2968,26 +3272,6 @@ fn json_number(text: &str, key: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
-/// Resolve an agent's context usage from where its client keeps it.
-fn resolve_usage(usage: &Usage, pid: u32) -> Option<Context> {
-    match usage {
-        Usage::ClaudeSession(dir) => session_context(dir, pid),
-        Usage::Opencode => opencode_context(pid),
-    }
-}
-
-/// The agent's own status, where its client reports one: Claude Code keeps
-/// `status` (`idle`, `busy`, `shell`…) and `statusUpdatedAt` (ms since the
-/// epoch) in its registration under `sessions/<pid>.json`. Anything but
-/// `idle` is busy; opencode reports nothing, and the screen hash stands in.
-fn resolve_status(usage: &Usage, pid: u32) -> Option<Status> {
-    let Usage::ClaudeSession(dir) = usage else { return None };
-    let home = std::env::var("HOME").ok()?;
-    let base = Path::new(dir).parent().and_then(Path::to_str).unwrap_or_default();
-    let json = std::fs::read_to_string(format!("{home}/{base}/sessions/{pid}.json")).ok()?;
-    session_status(&json)
-}
-
 /// `status`/`statusUpdatedAt` out of a Claude Code session registration.
 fn session_status(json: &str) -> Option<Status> {
     let status = json_string(json, "status")?;
@@ -3010,39 +3294,6 @@ fn log_tail_value(dir: &str, key: &str) -> Option<String> {
     let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let val = rest[..end].trim_matches('"');
     (!val.is_empty()).then(|| val.to_string())
-}
-
-/// opencode's currently selected model for the agent process's project dir
-/// (see `opencode_session`).
-fn opencode_selected(pid: u32) -> Option<String> {
-    json_string(&opencode_session(pid)?.1, "id")
-}
-
-/// opencode's context usage for the agent's session: the token total of the
-/// last answer in it (the conversation as the model saw it), against the
-/// model's context limit from opencode's own model catalog cache — left out
-/// when the catalog has no entry for it.
-fn opencode_context(pid: u32) -> Option<Context> {
-    use rusqlite::{Connection, OpenFlags};
-    let (session, model) = opencode_session(pid)?;
-    let conn = Connection::open_with_flags(opencode_db()?, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    let _ = conn.busy_timeout(Duration::from_millis(100));
-    // The last *finished* answer: the one still streaming has no total yet
-    // (0), and reading it made the footer flicker to nothing on every probe.
-    let used: u64 = conn
-        .query_row(
-            "SELECT json_extract(data, '$.tokens.total') FROM message \
-             WHERE session_id = ?1 AND json_extract(data, '$.role') = 'assistant' \
-               AND json_extract(data, '$.tokens.total') > 0 \
-             ORDER BY time_updated DESC LIMIT 1",
-            [session],
-            |row| row.get(0),
-        )
-        .ok()?;
-    let max = json_string(&model, "providerID")
-        .zip(json_string(&model, "id"))
-        .and_then(|(provider, id)| opencode_context_limit(&provider, &id));
-    Some(Context { used, max })
 }
 
 /// The context limit opencode's model catalog gives `provider`'s model `id`.
@@ -3075,32 +3326,6 @@ fn opencode_context_limit(provider: &str, id: &str) -> Option<u64> {
     limit
 }
 
-/// opencode's most recently used session for the agent process's project
-/// dir: its id and its model (a JSON blob with the provider and model ids).
-/// opencode is event-sourced into a SQLite DB; the live selection is the model
-/// of the most recently updated `session` row for that directory. Reading it
-/// via SQLite (vs. scanning bytes) is essential — WAL frame ordering makes raw
-/// scans return stale models. Opened read-only so opencode is never disturbed.
-fn opencode_session(pid: u32) -> Option<(String, String)> {
-    use rusqlite::{Connection, OpenFlags};
-    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-    let dir = cwd.to_str()?;
-    let conn = Connection::open_with_flags(opencode_db()?, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    let _ = conn.busy_timeout(Duration::from_millis(100));
-    conn.query_row(
-        "SELECT id, model FROM session \
-         WHERE directory = ?1 AND model IS NOT NULL \
-         ORDER BY time_updated DESC LIMIT 1",
-        [dir],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .ok()
-}
-
-fn opencode_db() -> Option<String> {
-    Some(format!("{}/.local/share/opencode/opencode.db", std::env::var("HOME").ok()?))
-}
-
 /// Read up to the last `max` bytes of a file (for cheaply tailing large logs).
 fn read_tail(path: &Path, max: u64) -> Option<Vec<u8>> {
     use std::io::{Seek, SeekFrom};
@@ -3110,24 +3335,6 @@ fn read_tail(path: &Path, max: u64) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).ok()?;
     Some(buf)
-}
-
-/// Value of env var `var` in process `pid` (read from /proc/<pid>/environ).
-fn env_var(pid: u32, var: &str) -> Option<String> {
-    let prefix = format!("{var}=");
-    std::fs::read(format!("/proc/{pid}/environ"))
-        .ok()?
-        .split(|b| *b == 0)
-        .filter_map(|kv| std::str::from_utf8(kv).ok())
-        .find_map(|kv| kv.strip_prefix(&prefix).map(str::to_string))
-        .filter(|m| !m.is_empty())
-}
-
-/// String value for `key` in the `$HOME`-relative JSON settings file at `rel`.
-fn settings_value(rel: &str, key: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let text = std::fs::read_to_string(format!("{home}/{rel}")).ok()?;
-    json_string(&text, key)
 }
 
 /// First string value for `"key"` in a JSON blob (naive, brace-agnostic — good
@@ -3670,6 +3877,62 @@ fn paste_text(text: &str) -> String {
     text.replace("\x1b[200~", "").replace("\x1b[201~", "").replace("\r\n", "\r").replace('\n', "\r")
 }
 
+/// What the footer shows while an unsent draft holds the auto feature back.
+const DRAFT_HOLD: &str = "✎ draft";
+
+/// The unsent-text estimate after the user sends `bytes` to a shell holding
+/// `draft` characters of it. Enter (`\r`) sends the line, Ctrl+C and Ctrl+U
+/// clear it, Backspace takes a character back, a paste and printable keys add
+/// to it; newlines inside a paste, Alt+Enter and Ctrl+J are text, not a send.
+/// Other keys move rather than type — except Up/Down, which recall a past
+/// prompt into an agent's composer, so they count as a draft of unknown size.
+/// An estimate by design: a draft typed and then deleted word by word still
+/// reads as one until Enter or Ctrl+C, which only ever holds a nudge back.
+fn draft_after(mut draft: usize, bytes: &[u8]) -> usize {
+    const PASTE: &[u8] = b"\x1b[200~";
+    const PASTED: &[u8] = b"\x1b[201~";
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if let Some(body) = rest.strip_prefix(PASTE) {
+            let len = body.windows(PASTED.len()).position(|w| w == PASTED).unwrap_or(body.len());
+            draft += String::from_utf8_lossy(&body[..len]).chars().count().max(1);
+            i += PASTE.len() + (len + PASTED.len()).min(body.len());
+            continue;
+        }
+        match rest[0] {
+            b'\r' | 0x03 | 0x15 => draft = 0,
+            0x7f | 0x08 => draft = draft.saturating_sub(1),
+            0x1b => {
+                let len = escape_len(rest);
+                if len > 2 && matches!(rest[len - 1], b'A' | b'B') {
+                    draft = draft.max(1);
+                }
+                i += len;
+                continue;
+            }
+            b'\n' | b'\t' => draft += 1,
+            byte if byte >= 0x20 && !(0x80..0xc0).contains(&byte) => draft += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    draft
+}
+
+/// Length of the escape sequence `bytes` starts with: a CSI (`ESC [` … final
+/// byte), an SS3 (`ESC O` x), an Alt chord (`ESC` x), or a lone `ESC`.
+fn escape_len(bytes: &[u8]) -> usize {
+    match bytes.get(1) {
+        Some(b'[') => {
+            bytes[2..].iter().position(|b| (0x40..=0x7e).contains(b)).map_or(bytes.len(), |at| at + 3)
+        }
+        Some(b'O') => bytes.len().min(3),
+        Some(_) => 2,
+        None => 1,
+    }
+}
+
 /// The control byte xterm sends for Ctrl+`c`. Most keys are the letter's low
 /// five bits, but the symbols between them are not: hosts send Ctrl+\\ as
 /// 0x1c, which crossterm reports as Ctrl+4 (and Ctrl+Space as Ctrl+' ') — so
@@ -3767,15 +4030,44 @@ fn word_span(chars: &[char], col: u16) -> (u16, u16) {
 }
 
 /// Order two (row, col) cells into reading order (top-to-bottom, left-to-right).
-fn order(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+fn order<T: PartialOrd>(a: T, b: T) -> (T, T) {
     if a <= b { (a, b) } else { (b, a) }
 }
 
 /// Top-left and bottom-right corners of the rectangle `a` and `b` span —
 /// each axis sorted on its own, so a block dragged toward the top-right or
 /// bottom-left is the same rectangle as one dragged the other way.
-fn corners(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+fn corners<R: Ord + Copy>(a: (R, u16), b: (R, u16)) -> ((R, u16), (R, u16)) {
     ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)))
+}
+
+/// The pane cells of `sel` a view scrolled back by `view` shows on a grid
+/// `rows` × `cols` — its ends clipped to the view, so a selection reaching
+/// far into the scrollback costs no more to draw than one on screen. `None`
+/// when none of it is in view.
+fn visible_selection(
+    sel: &Selection,
+    view: usize,
+    rows: u16,
+    cols: u16,
+) -> Option<Box<dyn Iterator<Item = (u16, u16)>>> {
+    let (rows, last_col) = (rows as isize, cols.checked_sub(1)?);
+    let on_screen = |(row, col): Pos| (row + view as isize, col);
+    let (a, b) = if sel.block {
+        corners(on_screen(sel.anchor), on_screen(sel.head))
+    } else {
+        order(on_screen(sel.anchor), on_screen(sel.head))
+    };
+    if b.0 < 0 || a.0 >= rows {
+        return None;
+    }
+    if sel.block {
+        let (top, bottom) = (a.0.max(0) as u16, b.0.min(rows - 1) as u16);
+        return Some(Box::new(block_cells((top, a.1), (bottom, b.1))));
+    }
+    let start = if a.0 < 0 { (0, 0) } else { (a.0 as u16, a.1) };
+    let end = if b.0 >= rows { ((rows - 1) as u16, last_col) } else { (b.0 as u16, b.1) };
+    Some(Box::new(selection_cells(start, end, cols)))
 }
 
 /// The (row, col) cells covered by a reading-order selection from `a` to `b`
@@ -3797,23 +4089,6 @@ fn selection_cells(a: (u16, u16), b: (u16, u16), cols: u16) -> impl Iterator<Ite
 fn block_cells(a: (u16, u16), b: (u16, u16)) -> impl Iterator<Item = (u16, u16)> {
     let (a, b) = corners(a, b);
     (a.0..=b.0).flat_map(move |r| (a.1..=b.1).map(move |c| (r, c)))
-}
-
-/// Text of a block selection: each row's columns from `a.1` to `b.1` (inclusive)
-/// joined by a newline, so the clipboard holds exactly the rectangle that was
-/// highlighted. Trailing blank space on each row is dropped, matching the
-/// reading-order copy.
-fn block_text(shell: &Shell, a: (u16, u16), b: (u16, u16), cols: u16) -> String {
-    let (a, b) = corners(a, b);
-    let mut out = String::new();
-    for r in a.0..=b.0 {
-        let row = shell.screen_between((r, a.1), (r, (b.1 + 1).min(cols)));
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(row.trim_end());
-    }
-    out
 }
 
 /// Put `text` on the clipboard by every route available, because no single one

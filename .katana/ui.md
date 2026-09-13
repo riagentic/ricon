@@ -14,7 +14,7 @@
 - a middle click in the pane pastes the primary selection into the shell (bracketed when the app asked for bracketed paste), as every terminal does — ricon holds the mouse, so the host terminal cannot
 - Alt+a selects the whole visible screen and copies it — "copy everything" is always drawn as a selection first, never taken behind the user's back
 - a selection belongs to the shell it was made in: switching tab or shell drops it
-- the wheel scrolls the pane and carries a live selection along with the lines it covers, so a selection can span more than one screenful; it is dropped once it has scrolled out of view
+- a selection covers text, not screen cells: the wheel scrolls the view over it, a drag can extend it across any number of screenfuls, and what is scrolled out of view stays selected and is copied whole; output arriving while the view is scrolled back keeps it on its text
 - a plain click (no drag) in the pane clears any selection; resizing the pane clears it (its grid coordinates go stale)
 
 ### Copy mode: selecting over an app that grabbed the mouse

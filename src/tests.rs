@@ -392,9 +392,9 @@ fn is_shell_matches_shells_including_login_and_paths() {
 }
 
 #[test]
-fn version_is_0_4_0() {
-    // Kata meta.md: ricon app version is 0.4.0.
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.0");
+fn version_is_0_4_1() {
+    // Kata meta.md: ricon app version is 0.4.1.
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.1");
 }
 
 // ── theming ──────────────────────────────────────────────────────────────────
@@ -676,12 +676,12 @@ fn spawned_shells_do_not_inherit_the_host_terminal_identity() {
         let shell = test_shell(dir.path());
         let pid = shell.pid.expect("shell pid");
         assert!(
-            wait_for(|| env_var(pid, "TERM").is_some(), Duration::from_secs(10)),
+            wait_for(|| Probe::new(pid).env("TERM").is_some(), Duration::from_secs(10)),
             "the shell's environ becomes readable"
         );
-        assert_eq!(env_var(pid, "TERM").as_deref(), Some("xterm-256color"));
+        assert_eq!(Probe::new(pid).env("TERM").as_deref(), Some("xterm-256color"));
         for var in HOST_TERMINAL_VARS {
-            assert_eq!(env_var(pid, var), None, "{var} must not follow the shell in");
+            assert_eq!(Probe::new(pid).env(var), None, "{var} must not follow the shell in");
         }
     });
 }
@@ -829,8 +829,8 @@ fn proc_helpers_read_own_process() {
     assert!(ppid > 0);
     assert!(descends_from(pid, ppid));
     assert!(!descends_from(pid, pid)); // a process is not its own ancestor
-    assert_eq!(env_var(pid, "PATH"), std::env::var("PATH").ok());
-    assert_eq!(env_var(pid, "RICON_TEST_UNSET_VAR"), None);
+    assert_eq!(Probe::new(pid).env("PATH"), std::env::var("PATH").ok());
+    assert_eq!(Probe::new(pid).env("RICON_TEST_UNSET_VAR"), None);
 }
 
 // ── live shells (PTY end-to-end) ─────────────────────────────────────────────
@@ -959,8 +959,9 @@ fn ctrl_c_is_never_shadowed_and_takes_the_highlight_down() {
     app.search_focus = false; // Esc on the search row only hands focus back
     app.selection = Some(Selection {
         shell: (0, 0),
-        anchor: (row, col),
-        head: (row, end),
+        anchor: (row as isize, col),
+        head: (row as isize, end),
+        shift: 0,
         dragging: false,
         block: false,
         text: None,
@@ -1309,8 +1310,8 @@ fn double_click_takes_the_word_and_triple_click_the_line() {
     app.copied_at = None;
     press(&mut app, col + 3);
     let sel = app.selection.as_ref().expect("triple click selects");
-    assert_eq!(sel.anchor, (row, 0), "the line starts at column 0");
-    assert_eq!(sel.head, (row, app.pty_cols - 1), "and runs to the last column");
+    assert_eq!(sel.anchor, (row as isize, 0), "the line starts at column 0");
+    assert_eq!(sel.head, (row as isize, app.pty_cols - 1), "and runs to the last column");
     let line = app.selection_text(sel.clone()).expect("line text");
     assert!(line.contains(tok), "the whole line: {line:?}");
     assert!(app.copied_at.is_some(), "a triple click copies too");
@@ -1330,7 +1331,7 @@ fn alt_a_selects_the_whole_screen_and_copies_it() {
     app.on_key(key(KeyCode::Char('a'), KeyModifiers::ALT)).expect("alt+a");
     let sel = app.selection.as_ref().expect("alt+a selects");
     assert_eq!(sel.anchor, (0, 0));
-    assert_eq!(sel.head, (app.pty_rows - 1, app.pty_cols - 1));
+    assert_eq!(sel.head, (app.pty_rows as isize - 1, app.pty_cols - 1));
     assert!(
         app.selection_text(sel.clone()).expect("text").contains(tok),
         "the visible screen is the selection"
@@ -1340,19 +1341,18 @@ fn alt_a_selects_the_whole_screen_and_copies_it() {
 
 #[test]
 fn scrolling_carries_the_selection_with_the_text() {
-    // Kata ui.md: the wheel scrolls the pane and the selection rides along with
-    // the lines it covers, so a selection can span more than one screenful.
+    // Kata ui.md: the wheel scrolls the pane and the selection stays on the
+    // lines it covers — scrolled out of view it is still selected, so it can
+    // span more than one screenful.
     let tok = "RICON_SCROLL_SEL";
     let (mut app, row, col) = app_with_token(tok);
     let sw = app.sidebar_width;
-    app.selection = Some(Selection {
-        shell: (0, 0),
-        anchor: (row, col),
-        head: (row, col + 3),
-        dragging: false,
-        block: false,
-        text: None,
-    });
+    let len = tok.len() as u16;
+    let press = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+    app.on_mouse(press(MouseEventKind::Down(MouseButton::Left), sw + col, row)).expect("press");
+    app.on_mouse(press(MouseEventKind::Drag(MouseButton::Left), sw + col + len - 1, row)).expect("drag");
+    let sel = app.selection.clone().expect("dragging");
+    assert_eq!(app.selection_text(sel).as_deref(), Some(tok), "the token is selected");
     // Fill the scrollback so there is somewhere to scroll to.
     app.tabs[0].active_shell().send(b"seq 1 200\r");
     // The echoed command already reads `seq 1 200`, so waiting for that text
@@ -1365,16 +1365,42 @@ fn scrolling_carries_the_selection_with_the_text() {
         ),
         "scrollback filled"
     );
+    // The token has scrolled up with the output: find where it lives now, and
+    // select from it down to the last live line across the screens between.
+    let back = app.tabs[0].active_shell().scroll(0);
+    assert_eq!(back, 0);
     let wheel = |kind| MouseEvent { kind, column: sw + 1, row: 1, modifiers: KeyModifiers::NONE };
-    app.on_mouse(wheel(MouseEventKind::ScrollUp)).expect("wheel up");
-    let sel = app.selection.as_ref().expect("the selection survives a scroll");
-    assert_eq!(sel.anchor.0, row + SCROLL_STEP as u16, "it moved down with the text");
-    assert_eq!(sel.anchor.1, col, "columns are untouched");
-    // Scrolling it clean off the grid drops it rather than leaving a lie on screen.
-    for _ in 0..app.pty_rows {
+    for _ in 0..200 {
+        app.on_mouse(wheel(MouseEventKind::ScrollUp)).expect("wheel up");
+        if screen_contents(app.tabs[0].active_shell()).contains(tok) {
+            break;
+        }
+    }
+    let (row, col) = screen_contents(app.tabs[0].active_shell())
+        .lines()
+        .enumerate()
+        .find_map(|(r, line)| line.find(tok).map(|c| (r as u16, c as u16)))
+        .expect("token in view");
+    app.on_mouse(press(MouseEventKind::Down(MouseButton::Left), sw + col, row)).expect("press on the token");
+    // Scroll back to the live screen mid-drag and release on its last line.
+    for _ in 0..200 {
+        app.on_mouse(wheel(MouseEventKind::ScrollDown)).expect("wheel down");
+    }
+    assert_eq!(app.tabs[0].active_shell().view(), 0, "back at the live screen");
+    let last = app.pty_rows - 1;
+    app.on_mouse(press(MouseEventKind::Drag(MouseButton::Left), sw + app.pty_cols - 1, last)).expect("drag");
+    app.on_mouse(press(MouseEventKind::Up(MouseButton::Left), sw + app.pty_cols - 1, last)).expect("release");
+    let text = app.selection.as_ref().and_then(|sel| sel.text.clone()).expect("copied");
+    assert!(text.starts_with(tok), "starts at the token, screens above: {text:?}");
+    assert!(
+        text.lines().any(|l| l.trim() == "1") && text.lines().any(|l| l.trim() == "200"),
+        "and runs through all of it"
+    );
+    // Scrolling it clean off the view keeps it: it is text, not cells.
+    for _ in 0..200 {
         app.on_mouse(wheel(MouseEventKind::ScrollUp)).expect("wheel up");
     }
-    assert!(app.selection.is_none(), "a selection scrolled out of view is dropped");
+    assert!(app.selection.is_some(), "a selection scrolled out of view is still selected");
 }
 
 #[test]
@@ -1386,6 +1412,7 @@ fn selection_is_dropped_when_another_shell_takes_the_screen() {
         shell: (0, 0),
         anchor: (1, 1),
         head: (1, 5),
+        shift: 0,
         dragging: false,
         block: false,
         text: None,
@@ -2656,7 +2683,7 @@ fn claude_and_openclaude_read_the_live_session_model_first() {
     with_home(dir.path(), || {
         for client in ["claude", "openclaude"] {
             let spec = AGENTS.iter().find(|s| s.comm == client).expect("spec");
-            let model = spec.sources.iter().find_map(|src| resolve_source(src, std::process::id()));
+            let model = spec.sources.iter().find_map(|src| Probe::new(std::process::id()).source(src));
             assert_eq!(model.as_deref(), Some(format!("{client}-now").as_str()), "{client}");
         }
     });
@@ -2680,7 +2707,7 @@ fn claude_and_openclaude_read_their_settings_model() {
             let spec = AGENTS.iter().find(|s| s.comm == client).expect("spec");
             // `pid` is unused by a settings source; resolution stops at the
             // first source that answers, exactly as the probe thread does.
-            let model = spec.sources.iter().find_map(|src| resolve_source(src, std::process::id()));
+            let model = spec.sources.iter().find_map(|src| Probe::new(std::process::id()).source(src));
             assert_eq!(model.as_deref(), Some(format!("{client}-model").as_str()));
         }
     });
@@ -2719,24 +2746,27 @@ fn claude_resolves_its_own_session_by_pid_before_the_newest_file() {
     )
     .expect("registration");
     with_home(dir.path(), || {
-        assert_eq!(session_tail_model(".claude/projects", pid).as_deref(), Some("mine-model"));
+        assert_eq!(Probe::new(pid).session_model(".claude/projects").as_deref(), Some("mine-model"));
         // Context usage rides on the same file: the last answer's input, the
         // cache it wrote and the cache it read — not the per-iteration copies.
-        let context = session_context(".claude/projects", pid).expect("usage");
+        let context = Probe::new(pid).session_context(".claude/projects").expect("usage");
         assert_eq!(context, Context { used: 121_000, max: Some(CONTEXT_WINDOW) });
         // A `[1m]` model in the client's settings means the wide window.
         std::fs::write(dir.path().join(".claude/settings.json"), "{\"model\":\"claude-opus-5[1m]\"}")
             .expect("settings");
-        assert_eq!(session_context(".claude/projects", pid).expect("usage").max, Some(WIDE_CONTEXT_WINDOW));
+        assert_eq!(
+            Probe::new(pid).session_context(".claude/projects").expect("usage").max,
+            Some(WIDE_CONTEXT_WINDOW)
+        );
         // A registered session with no transcript yet (new, or just after
         // `/clear`) has no model to show — the newest file is someone else's.
         std::fs::write(dir.path().join(format!(".claude/sessions/{pid}.json")), "{\"sessionId\":\"gone\"}")
             .expect("unwritten registration");
-        assert_eq!(session_tail_model(".claude/projects", pid), None);
-        assert_eq!(session_context(".claude/projects", pid), None, "nor its usage");
+        assert_eq!(Probe::new(pid).session_model(".claude/projects"), None);
+        assert_eq!(Probe::new(pid).session_context(".claude/projects"), None, "nor its usage");
         // A client that registers nothing falls back to the newest file.
         std::fs::remove_file(dir.path().join(format!(".claude/sessions/{pid}.json"))).expect("unregister");
-        assert_eq!(session_tail_model(".claude/projects", pid).as_deref(), Some("other-model"));
+        assert_eq!(Probe::new(pid).session_model(".claude/projects").as_deref(), Some("other-model"));
     });
 }
 
@@ -3642,7 +3672,7 @@ fn test_meta() -> transcript::Meta {
 /// Feed `text` to a shell's screen and commit what that leaves ready, exactly
 /// as the reader thread does after every chunk it parses.
 fn feed(parser: &Mutex<vt100::Parser>, log: &Transcript, text: &str) {
-    parser.lock().unwrap_or_else(PoisonError::into_inner).process(text.as_bytes());
+    log.process(&mut parser.lock().unwrap_or_else(PoisonError::into_inner), text.as_bytes());
     log.pump(parser, Pump::Output);
 }
 
@@ -3907,7 +3937,7 @@ fn transcript_close_commits_what_scrolled_off_since_the_last_pass() {
         let parser = test_parser(4, 40, 100);
         feed(&parser, &log, "first\r\n");
         // Parsed, but the reader thread never got to pump it: the tab closed.
-        parser.lock().expect("parser").process(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n");
+        log.process(&mut parser.lock().expect("parser"), b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n");
         log.close(&parser);
         let text = only_transcript(dir.path());
         for line in ["first", "a", "b", "f"] {
@@ -3998,13 +4028,39 @@ fn json_string_reads_only_string_values_of_keys() {
 
 #[test]
 fn session_usage_is_found_behind_a_huge_line() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let file = dir.path().join("s.jsonl");
+    // One tool result can be hundreds of KiB: the tail widens until the last
+    // answer is in it, and model and usage share the one read.
+    let home = tempfile::tempdir().expect("tempdir");
+    let cwd = std::env::current_dir().expect("cwd");
+    let slug: String = cwd
+        .to_str()
+        .expect("utf8 cwd")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let pid = std::process::id();
+    let project = home.path().join(".claude/projects").join(&slug);
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::create_dir_all(home.path().join(".claude/sessions")).expect("sessions dir");
+    std::fs::write(home.path().join(format!(".claude/sessions/{pid}.json")), "{\"sessionId\":\"big\"}")
+        .expect("registration");
     let answer = "{\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":7}}}\n";
     let tool = format!("{{\"toolUseResult\":\"{}\"}}\n", "x".repeat(300 * 1024));
-    std::fs::write(&file, format!("{answer}{tool}")).expect("write");
-    assert_eq!(scan_tail(&file, last_session_usage), Some(7), "past the first 64 KiB");
-    assert_eq!(scan_tail(&file, |_: &str| None::<u64>), None, "and it stops at the file's start");
+    std::fs::write(project.join("big.jsonl"), format!("{answer}{tool}")).expect("write");
+    with_home(home.path(), || {
+        let probe = Probe::new(pid);
+        assert_eq!(
+            probe.session_context(".claude/projects").map(|c| c.used),
+            Some(7),
+            "past the first 64 KiB"
+        );
+        assert_eq!(probe.session_model(".claude/projects").as_deref(), Some("m"), "from the same window");
+        assert_eq!(
+            probe.session_tail(".claude/projects", |_: &str| None::<u64>),
+            None,
+            "stops at the file's start"
+        );
+    });
 }
 
 #[test]
@@ -4084,4 +4140,146 @@ fn closing_the_cheat_sheet_swallows_the_rest_of_its_click() {
     assert!(!app.help && app.swallow_release, "closed, and the release is ricon's");
     app.on_mouse(at(MouseEventKind::Up(MouseButton::Left))).expect("release");
     assert!(!app.swallow_release, "swallowed once, then the mouse is the app's again");
+}
+
+#[test]
+fn transcript_keeps_a_repeated_block_that_matches_its_anchor() {
+    // The reader thread counts the lines each chunk pushes, so output that
+    // repeats the last committed rows exactly is still new output.
+    let dir = tempfile::tempdir().expect("tempdir");
+    with_transcripts(dir.path(), || {
+        let (cap, rows) = (40, 4);
+        let log = Transcript::new(cap);
+        log.arm(test_meta());
+        let parser = test_parser(rows, 40, cap);
+        let block: String = (0..20).map(|i| format!("same-{}\r\n", i % 2)).collect();
+        for _ in 0..6 {
+            feed(&parser, &log, &block);
+        }
+        feed(&parser, &log, "end\r\n1\r\n2\r\n3\r\n4\r\n");
+        log.close(&parser);
+        let text = only_transcript(dir.path());
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("same-")).count(),
+            120,
+            "every repeat is kept: {text}"
+        );
+    });
+}
+
+#[test]
+fn transcript_commits_a_soft_wrapped_line_whole() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    with_transcripts(dir.path(), || {
+        let log = Transcript::new(100);
+        log.arm(test_meta());
+        let parser = test_parser(4, 10, 100);
+        let long = "abcdefghijKLMNOPQRSTuvwxy";
+        feed(&parser, &log, &format!("{long}\r\none\r\ntwo\r\nthree\r\nfour\r\n"));
+        // A second long line straddling the screen's top when the session closes.
+        feed(&parser, &log, &format!("{long}\r\n"));
+        feed(&parser, &log, "x\r\n");
+        log.close(&parser);
+        let text = only_transcript(dir.path());
+        assert_eq!(text.lines().filter(|l| *l == long).count(), 2, "one line each, not three rows: {text}");
+    });
+}
+
+#[test]
+fn counting_pushed_lines_leaves_the_users_view_where_the_emulator_would() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    with_transcripts(dir.path(), || {
+        let log = Transcript::new(100);
+        log.arm(test_meta());
+        let parser = test_parser(4, 40, 100);
+        feed(&parser, &log, "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n");
+        assert_eq!(parser.lock().expect("parser").screen().scrollback(), 0, "a live view stays live");
+        parser.lock().expect("parser").screen_mut().set_scrollback(2);
+        feed(&parser, &log, "7\r\n8\r\n");
+        assert_eq!(
+            parser.lock().expect("parser").screen().scrollback(),
+            4,
+            "a scrolled-back view stays on its text"
+        );
+    });
+}
+
+#[test]
+fn draft_counts_what_the_keys_leave_unsent() {
+    assert_eq!(draft_after(0, b"hello"), 5);
+    assert_eq!(draft_after(5, b"\x7f\x7f"), 3, "backspace takes back");
+    assert_eq!(draft_after(3, b"\r"), 0, "enter sends");
+    assert_eq!(draft_after(3, b"\x03"), 0, "ctrl+c clears");
+    assert_eq!(draft_after(0, b"\x1b[200~a\nb\x1b[201~"), 3, "a paste is text, its newline too");
+    assert_eq!(draft_after(0, b"\x1b[C\x1b[D\x1bOC"), 0, "moving is not typing");
+    assert_eq!(draft_after(0, b"\x1b[A"), 1, "history recall fills the composer");
+    assert_eq!(draft_after(2, b"\x1b\r"), 2, "alt+enter is a newline, not a send");
+    assert_eq!(draft_after(0, "héllo".as_bytes()), 5, "characters, not bytes");
+}
+
+#[test]
+fn an_unsent_draft_holds_the_nudge_and_says_so() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut shell = test_shell(dir.path());
+    let idle_since = SystemTime::now() - IDLE_NUDGE * 2;
+    shell.agent = Some(AgentInfo {
+        name: "claude",
+        model: "claude-opus-5".into(),
+        pid: 1,
+        context: None,
+        status: Some(Status::Idle(idle_since)),
+    });
+    shell.last_input = Instant::now() - IDLE_NUDGE * 3;
+    assert!(shell.nudge_due(), "idle long enough");
+    shell.draft = 12;
+    shell.drafted = Instant::now() - Duration::from_secs(60); // typed after the agent went idle
+    assert!(!shell.nudge_due(), "a half-written message holds it");
+    assert!(shell.countdown().is_none(), "no countdown to a nudge that is held");
+    let footer = Footer {
+        index: 0,
+        count: 1,
+        shell: &shell,
+        branch: None,
+        width: 120,
+        tabs_overflow: false,
+        copy_mode: true,
+        auto: true,
+    };
+    assert!(line_text(&status_bar(footer)).contains(DRAFT_HOLD), "the footer says why");
+    // The client went busy and idle again after the draft: it took the text.
+    shell.drafted = Instant::now() - IDLE_NUDGE * 4;
+    assert!(shell.nudge_due(), "a draft the client has since taken holds nothing");
+}
+
+#[test]
+fn a_selection_stays_on_its_text_when_output_scrolls_under_a_scrolled_back_view() {
+    let tok = "RICON_PINNED_SEL";
+    let (mut app, row, col) = app_with_token(tok);
+    let len = tok.len() as u16;
+    app.tabs[0].active_shell().send(b"seq 1 60\r");
+    assert!(
+        wait_for(
+            || screen_contents(app.tabs[0].active_shell()).lines().any(|l| l.trim() == "60"),
+            Duration::from_secs(10)
+        ),
+        "scrollback filled"
+    );
+    let _ = (row, col);
+    app.scroll_pane(1000);
+    let (row, col) = screen_contents(app.tabs[0].active_shell())
+        .lines()
+        .enumerate()
+        .find_map(|(r, line)| line.find(tok).map(|c| (r as u16, c as u16)))
+        .expect("token in view at the top of the history");
+    app.select_span((0, 0), ((row, col), (row, col + len - 1)));
+    assert_eq!(app.selection.as_ref().and_then(|s| s.text.as_deref()), Some(tok));
+    // More output while scrolled back: the emulator keeps the view on its text.
+    app.tabs[0].active_shell().send(b"seq 1 5\r");
+    let shell = app.tabs[0].active_shell();
+    let view = shell.view();
+    assert!(wait_for(|| shell.view() > view, Duration::from_secs(10)), "output scrolled under the view");
+    app.sync_selection();
+    let mut sel = app.selection.clone().expect("selection");
+    sel.text = None; // read the live text at its (carried) position
+    assert_eq!(app.selection_text(sel).as_deref(), Some(tok), "still the token");
 }

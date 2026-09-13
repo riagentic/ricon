@@ -17,7 +17,7 @@
 - auto feature is for each tab, on the first line of the tab after its text and indicators, glued to the right edge of the tab panel
 - when "continue" feature is enabled and supported ai client is running in the particular tab and the agent has been waiting for user input for 10 minutes, then ricon types and confirms `/compact` so the conversation is summarized first
 - waiting is what the client itself reports where it does: claude code registers `status` (`idle`, else busy) and `statusUpdatedAt` under `~/.claude/sessions/<pid>.json`, and that is exact; a client reporting nothing (opencode) is waiting when the visible console content is unchanged — bytes that repaint the same screen (cursor blink, redraw ticks) are not activity
-- the wait never runs past the user's last keystroke into that shell, nor past the auto feature's own last nudge: typing into the tab defers the nudge
+- the wait never runs past the user's last keystroke into that shell, nor past the auto feature's own last nudge: typing into the tab defers the nudge; a message typed but not sent (keys since the last Enter or Ctrl+C left text in the composer) holds it until it is sent — the status bar then shows `✎ draft` instead of the countdown
 - proactive compaction: with the context past 70% of its window, an agent waiting for 60 seconds is compacted at once (the same two steps), and not again within 10 minutes — the usage read is the last answer's and only drops after the agent has answered again
 - with the auto feature on, the status bar counts down to the nudge (`⏳ 7:12 → /compact`) once the agent has been waiting 30 seconds; while a nudge is under way it shows `⟳ /compact`, then `⟳` until the agent answers
 - the context usage in the status bar is painted red from 80% of the window
@@ -34,7 +34,8 @@
 - while a supported ai client (claude, openclaude, opencode) runs in a shell, ricon appends that console's text to a dated file, so the session survives a power cut and can be fed back to the agent as lost context
 - transcripts live in `$RICON_TRANSCRIPTS`, else `$XDG_DATA_HOME/ricon/sessions`, else `~/.local/share/ricon/sessions`, in a `YYYY-MM-DD` directory, one file per agent session named `HHMMSS-<client>-<folder>-<pid>.txt`; the transcript closes when the agent leaves the shell, and a later agent in the same shell gets a file of its own
 - `RICON_TRANSCRIPTS=off` (or `0`, `no`, `false`, empty) writes no transcripts at all
-- the file is plain console text — what the terminal showed, not the escape sequences that drew it — with a header naming the client, the model and the working directory
+- the file is plain console text — what the terminal showed, not the escape sequences that drew it — with a header naming the client, the model and the working directory; a line the terminal soft-wrapped is written whole, as it was printed
+- the lines a chunk of output pushes into the scrollback are counted as they are parsed, so output repeating what was just written is never mistaken for it
 - a line is written once and never twice, and never stops being written — also once the shell's scrollback is full; a dated marker separates blocks written more than a minute apart
 - the last screen, which has not scrolled off yet, is kept in a `<name>.tail.txt` sidecar beside the transcript and folded into it (sidecar removed) when the shell or the app closes
 - a client holding the alternate screen (its chat scrolls inside it, never into the scrollback) is recorded as screen snapshots of settled frames instead — at most one every two seconds, and only when the screen changed

@@ -34,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex, MutexGuard, PoisonError, TryLockError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -94,11 +94,20 @@ pub struct Meta {
 /// shell's own output but never a frame.
 pub struct Transcript {
     armed: AtomicBool,
+    /// The parser's scrollback limit.
+    cap: usize,
     /// Bumped by every `arm`: a flush thread serves only the session it was
     /// started for, and retires when that one ends.
     session: AtomicU64,
+    /// Lines the reader thread's chunks pushed into the scrollback since the
+    /// last capture pass, counted exactly by `process`; `UNCOUNTED` once any
+    /// went uncounted.
+    pushed: AtomicUsize,
     inner: Mutex<Inner>,
 }
+
+/// `Transcript::pushed` when the count is not known.
+const UNCOUNTED: usize = usize::MAX;
 
 struct Inner {
     capture: Capture,
@@ -154,6 +163,10 @@ struct Capture {
     anchor: VecDeque<u64>,
     /// The next pass is a session's first: it takes at most `CATCH_UP` lines.
     catch_up: bool,
+    /// The start of a line the terminal soft-wrapped whose rest has not
+    /// scrolled off yet: a line is committed whole, as it was printed, not cut
+    /// at the terminal's width.
+    pending: String,
     /// Last screen committed as a snapshot, and when.
     snap: u64,
     snapped: Instant,
@@ -177,6 +190,7 @@ impl Capture {
             logged: 0,
             anchor: VecDeque::with_capacity(ANCHOR),
             catch_up: true,
+            pending: String::new(),
             snap: 0,
             snapped: stale(SNAPSHOT_EVERY),
             drawn: stale(SNAPSHOT_SETTLE),
@@ -189,7 +203,7 @@ impl Capture {
     /// Everything `screen` is ready to hand over. Runs under the parser lock:
     /// it reads and restores the scrollback view, allocates only the lines it
     /// returns, and does no IO.
-    fn take(&mut self, screen: &mut vt100::Screen, pump: Pump) -> Take {
+    fn take(&mut self, screen: &mut vt100::Screen, pump: Pump, pushed: Option<usize>) -> Take {
         if pump == Pump::Output {
             if self.drawn.elapsed() >= SNAPSHOT_SETTLE {
                 self.burst = Instant::now();
@@ -202,7 +216,7 @@ impl Capture {
             // holds the alternate screen — the screen itself is the only record.
             take.snapshot = self.snapshot(screen);
         } else {
-            take.history = self.scrolled_off(screen);
+            take.history = self.scrolled_off(screen, pushed);
         }
         if pump == Pump::Flush {
             take.tail = self.mirror(screen);
@@ -216,26 +230,25 @@ impl Capture {
     /// so no frame — and no live selection — can see it shift. Only what has
     /// left the screen is taken: it is final, whereas the screen is still being
     /// drawn on (that is what the sidecar is for).
-    fn scrolled_off(&mut self, screen: &mut vt100::Screen) -> Vec<String> {
+    fn scrolled_off(&mut self, screen: &mut vt100::Screen, pushed: Option<usize>) -> Vec<String> {
         let (rows, cols) = screen.size();
         if rows == 0 {
             return Vec::new();
         }
         let view = screen.scrollback();
-        // `set_scrollback` clamps to the buffer, so asking for everything
-        // reports how many lines it holds.
-        screen.set_scrollback(usize::MAX);
-        let total = screen.scrollback();
-        let (uncommitted, adjoins) = self.uncommitted(screen, total);
+        let total = history(screen);
+        let (uncommitted, adjoins) = self.uncommitted(screen, total, pushed);
         let fresh = if std::mem::replace(&mut self.catch_up, false) {
             uncommitted.min(CATCH_UP)
         } else {
             uncommitted
         };
         // The anchor must be the rows right before the ones taken now; after a
-        // gap (history skipped by a catch-up, or the anchor lost) it restarts.
+        // gap (history skipped by a catch-up, or the anchor lost) it restarts,
+        // and so does a wrapped line begun before the gap.
         if !adjoins || fresh < uncommitted {
             self.anchor.clear();
+            self.pending.clear();
         }
         let mut lines = Vec::with_capacity(fresh);
         let mut next = total - fresh;
@@ -243,36 +256,50 @@ impl Capture {
             // The view at offset `total - next` starts with row `next`.
             screen.set_scrollback(total - next);
             let n = (total - next).min(usize::from(rows));
-            lines.extend(screen.rows(0, cols).take(n));
+            let texts: Vec<String> = screen.rows(0, cols).take(n).collect();
+            for (at, text) in texts.into_iter().enumerate() {
+                if self.anchor.len() == ANCHOR {
+                    self.anchor.pop_front();
+                }
+                self.anchor.push_back(digest(&text));
+                self.pending.push_str(&text);
+                if !screen.row_wrapped(at as u16) {
+                    lines.push(std::mem::take(&mut self.pending));
+                }
+            }
             next += n;
         }
         screen.set_scrollback(view);
         self.logged = total;
-        for line in &lines {
-            if self.anchor.len() == ANCHOR {
-                self.anchor.pop_front();
-            }
-            self.anchor.push_back(digest(line));
-        }
         lines
     }
 
     /// How many of the `total` scrollback rows — counted from the newest — are
     /// not committed yet, and whether they directly follow the anchor.
     ///
-    /// Until the buffer is full its growth is the answer, confirmed by the
-    /// newest committed row still sitting where it was left. A full buffer
-    /// drops a line for every one it takes, so its length says nothing: the
-    /// committed rows are then found by content — the smallest shift at which
-    /// the newest `ANCHOR` rows committed reappear. The one output that can
-    /// fool it is a run of exactly those rows printed again, which is then
-    /// taken as already written; anything shorter or different cannot. A shell
-    /// reset (the buffer cleared) or a flood past the whole buffer leaves no
-    /// anchor to find, and every row is new.
-    fn uncommitted(&self, screen: &mut vt100::Screen, total: usize) -> (usize, bool) {
+    /// Normally the reader thread has counted them as they were pushed
+    /// (`Transcript::process`), and the newest committed row sitting right
+    /// above them confirms it. Without a count (the session's first pass, a
+    /// chunk that entered the alternate screen) the buffer's growth is the
+    /// answer until it is full, confirmed the same way. A full buffer drops a
+    /// line for every one it takes, so its length says nothing: the committed
+    /// rows are then found by content — the smallest shift at which the newest
+    /// `ANCHOR` rows committed reappear, which only a run of exactly those rows
+    /// printed again in an uncounted chunk could fool. A shell reset (the
+    /// buffer cleared) or a flood past the whole buffer leaves no anchor to
+    /// find, and every row is new.
+    fn uncommitted(&self, screen: &mut vt100::Screen, total: usize, pushed: Option<usize>) -> (usize, bool) {
         let Some(&newest) = self.anchor.back() else {
-            return (total.saturating_sub(self.logged), false);
+            // Below the cap the growth is exact whatever processed the bytes.
+            let grown = total.saturating_sub(self.logged);
+            let count = if total < self.cap { grown } else { pushed.unwrap_or(grown) };
+            return (count.min(total), false);
         };
+        if let Some(count) = pushed.filter(|&count| count < total)
+            && row_digest(screen, total, total - 1 - count) == Some(newest)
+        {
+            return (count, true);
+        }
         if total < self.cap
             && (1..=total).contains(&self.logged)
             && row_digest(screen, total, self.logged - 1) == Some(newest)
@@ -345,7 +372,9 @@ impl Transcript {
     pub fn new(scrollback: usize) -> Self {
         Self {
             armed: AtomicBool::new(false),
+            cap: scrollback,
             session: AtomicU64::new(0),
+            pushed: AtomicUsize::new(UNCOUNTED),
             inner: Mutex::new(Inner { capture: Capture::new(scrollback), meta: None, sink: None }),
         }
     }
@@ -363,8 +392,10 @@ impl Transcript {
         if inner.meta.is_none() {
             return; // closed while this pass waited for the lock
         }
-        let take =
-            inner.capture.take(parser.lock().unwrap_or_else(PoisonError::into_inner).screen_mut(), pump);
+        let take = {
+            let mut parser = parser.lock().unwrap_or_else(PoisonError::into_inner);
+            inner.capture.take(parser.screen_mut(), pump, self.take_pushed())
+        };
         if inner.write(take, pump).is_none() {
             // Nowhere to write (no HOME, unwritable directory): stop trying
             // rather than retrying per chunk for the rest of the session.
@@ -392,6 +423,9 @@ impl Transcript {
         }
         inner.meta = Some(meta);
         inner.capture.catch_up = true;
+        // Whatever was pushed before the session is history the catch-up
+        // takes by the buffer, not by a count.
+        self.pushed.store(UNCOUNTED, Ordering::Release);
         let session = self.session.fetch_add(1, Ordering::AcqRel) + 1;
         self.armed.store(true, Ordering::Release);
         Some(session)
@@ -401,6 +435,54 @@ impl Transcript {
     /// it and again once its transcript is closed.
     pub fn armed(&self) -> bool {
         self.armed.load(Ordering::Acquire)
+    }
+
+    /// Parse `bytes` into `parser`'s screen — what the reader thread does with
+    /// every chunk — counting, while a session is on, the lines it pushes into
+    /// the scrollback. The emulator counts them itself for a view scrolled
+    /// back: it raises the offset one row per pushed line to keep that view on
+    /// its text. So the chunk is parsed with the view scrolled back by at least
+    /// one row, and the rise is the count; the view is then left where the
+    /// emulator would have left the user's own. All under the one parser lock,
+    /// so no frame ever sees the borrowed offset. No count when the chunk
+    /// touched the alternate screen, when the offset hit the top of the buffer,
+    /// or when the chunk reset it.
+    pub fn process(&self, parser: &mut vt100::Parser, bytes: &[u8]) {
+        if !self.armed() {
+            parser.process(bytes);
+            return;
+        }
+        let screen = parser.screen_mut();
+        let (alternate, view) = (screen.alternate_screen(), screen.scrollback());
+        let before = history(screen);
+        let probe = view.max(1);
+        screen.set_scrollback(probe);
+        parser.process(bytes);
+        let screen = parser.screen_mut();
+        let risen = screen.scrollback();
+        let after = history(screen);
+        let count = if alternate || screen.alternate_screen() {
+            None
+        } else if before == 0 {
+            // Nothing to scroll back into yet — and nothing evicted either.
+            (after < self.cap).then_some(after)
+        } else {
+            (risen >= probe && risen < after).then(|| risen - probe)
+        };
+        screen.set_scrollback(if view == 0 { 0 } else { risen });
+        let _ = self.pushed.fetch_update(Ordering::AcqRel, Ordering::Acquire, |pushed| {
+            Some(match count {
+                Some(count) if pushed != UNCOUNTED => pushed.saturating_add(count).min(UNCOUNTED - 1),
+                _ => UNCOUNTED,
+            })
+        });
+    }
+
+    /// The pushed-line count since the last pass, reset for the next. Taken
+    /// under the parser lock, so no chunk lands between the count and the
+    /// screen it describes.
+    fn take_pushed(&self) -> Option<usize> {
+        Some(self.pushed.swap(0, Ordering::AcqRel)).filter(|&pushed| pushed != UNCOUNTED)
     }
 
     /// Is `session` the one still being transcribed? What a flush thread
@@ -426,8 +508,18 @@ impl Transcript {
             let mut parser = parser.lock().unwrap_or_else(PoisonError::into_inner);
             let screen = parser.screen_mut();
             let alternate = screen.alternate_screen();
-            let history = if alternate { Vec::new() } else { capture.scrolled_off(screen) };
-            let last = compact(visible(screen));
+            let history =
+                if alternate { Vec::new() } else { capture.scrolled_off(screen, self.take_pushed()) };
+            let mut last = visible(screen);
+            // A wrapped line that began in the scrollback ends on screen.
+            let begun = std::mem::take(&mut capture.pending);
+            if !begun.is_empty() {
+                match last.first_mut() {
+                    Some(first) => first.insert_str(0, &begun),
+                    None => last.push(begun),
+                }
+            }
+            let last = compact(last);
             // The alternate screen's last frame may be the last snapshot.
             let fresh = !(alternate && digest(&last) == capture.snap);
             (history, if fresh { last } else { Vec::new() })
@@ -564,13 +656,33 @@ impl Sink {
 /// The live screen as lines, trailing blanks dropped. Read at scrollback offset
 /// 0 whatever the user is looking at, and the view is restored before the lock
 /// is released so no frame can see it move.
-pub fn visible(screen: &mut vt100::Screen) -> Vec<String> {
+fn visible(screen: &mut vt100::Screen) -> Vec<String> {
     let (_, cols) = screen.size();
     let view = screen.scrollback();
     screen.set_scrollback(0);
-    let lines: Vec<String> = screen.rows(0, cols).collect();
+    let texts: Vec<String> = screen.rows(0, cols).collect();
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for (row, text) in texts.into_iter().enumerate() {
+        line.push_str(&text);
+        // Soft-wrapped rows are one line, as they were printed.
+        if !screen.row_wrapped(row as u16) {
+            lines.push(std::mem::take(&mut line));
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
     screen.set_scrollback(view);
     trimmed(lines)
+}
+
+/// How many lines `screen`'s scrollback holds. Leaves the view at the top.
+fn history(screen: &mut vt100::Screen) -> usize {
+    // `set_scrollback` clamps to the buffer, so asking for everything reports
+    // its length.
+    screen.set_scrollback(usize::MAX);
+    screen.scrollback()
 }
 
 /// Digest of scrollback row `row` (0 = oldest) of a buffer `total` rows long.
