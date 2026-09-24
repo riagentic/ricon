@@ -28,7 +28,7 @@
 
 use std::{
     collections::VecDeque,
-    fs::{File, OpenOptions},
+    fs::File,
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -41,7 +41,7 @@ use std::{
 
 use tui_term::vt100;
 
-use crate::{expand_home, folder_name, stale};
+use crate::{expand_home, folder_name, private_dir, private_file, stale};
 
 /// Directory to write transcripts into; `off`/`0`/empty turns the feature off.
 const DIR_VAR: &str = "RICON_TRANSCRIPTS";
@@ -585,11 +585,11 @@ impl Sink {
     fn create(meta: &Meta) -> Option<Self> {
         let now = now();
         let dir = transcript_dir()?.join(now.date());
-        std::fs::create_dir_all(&dir).ok()?;
+        private_dir(&dir).ok()?;
         let name =
             format!("{}-{}-{}-{}", now.compact(), tame(&meta.agent), tame(&folder_name(&meta.cwd)), meta.pid);
         let path = dir.join(format!("{name}.txt"));
-        let mut file = OpenOptions::new().create(true).append(true).open(&path).ok()?;
+        let mut file = private_file().create(true).append(true).open(&path).ok()?;
         let header = format!(
             "# ricon session transcript\n# started {}\n# agent   {} ({})\n# cwd     {}\n\n",
             now.full(),
@@ -639,10 +639,11 @@ impl Sink {
         let mut text = lines.join("\n");
         text.push('\n');
         let staged = self.tail.with_extension("new");
-        let written = File::create(&staged).and_then(|mut file| {
-            file.write_all(text.as_bytes())?;
-            file.sync_data()
-        });
+        let written =
+            private_file().write(true).create(true).truncate(true).open(&staged).and_then(|mut file| {
+                file.write_all(text.as_bytes())?;
+                file.sync_data()
+            });
         match written.and_then(|()| std::fs::rename(&staged, &self.tail)) {
             Ok(()) => Ok(()),
             Err(error) => {

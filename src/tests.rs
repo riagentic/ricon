@@ -156,6 +156,8 @@ fn test_app(shell_counts: &[usize]) -> App {
         agent_probe: AgentProbe::spawn(),
         agent_cursor: 0,
         drawn: Instant::now() - POLL_INTERVAL,
+        ticked: Instant::now() - POLL_INTERVAL,
+        dirty: true,
         quit: false,
         confirm_quit: None,
         help: false,
@@ -297,6 +299,17 @@ fn truncate_tail_is_char_safe_on_multibyte() {
 }
 
 #[test]
+fn truncation_budgets_cells_not_chars() {
+    // Wide characters take two cells: a budget of 5 holds `…` + two of them.
+    let tail = truncate_tail("項目フォルダ", 10, 5);
+    assert_eq!(tail, "…ルダ", "`…` (1) + two wide chars (4) fill 5 cells; a third would not fit");
+    assert!(tail.width() <= 5);
+    let head = truncate_head("echo 日本語テキスト", 12, 5);
+    assert!(head.width() <= 7, "{head:?} fits its 7 cells");
+    assert!(head.ends_with('…') && head.starts_with("echo"));
+}
+
+#[test]
 fn truncate_head_keeps_command_start_and_is_char_safe() {
     // Fits within width - pad: unchanged (a command reads from its front).
     assert_eq!(truncate_head("cargo test", 20, 7), "cargo test");
@@ -392,9 +405,9 @@ fn is_shell_matches_shells_including_login_and_paths() {
 }
 
 #[test]
-fn version_is_0_4_1() {
-    // Kata meta.md: ricon app version is 0.4.1.
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.1");
+fn version_is_0_4_2() {
+    // Kata meta.md: ricon app version is 0.4.2.
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.2");
 }
 
 // ── theming ──────────────────────────────────────────────────────────────────
@@ -458,6 +471,8 @@ fn encode_key_alt_prefixes_escape_on_text_keys() {
 fn encode_key_basic_controls() {
     assert_eq!(encode_key(&key(KeyCode::Enter, KeyModifiers::NONE), false), Some(b"\r".to_vec()));
     assert_eq!(encode_key(&key(KeyCode::Backspace, KeyModifiers::NONE), false), Some(vec![0x7f]));
+    assert_eq!(encode_key(&key(KeyCode::Backspace, KeyModifiers::CONTROL), false), Some(vec![0x08]));
+    assert_eq!(encode_key(&key(KeyCode::Backspace, KeyModifiers::ALT), false), Some(vec![0x1b, 0x7f]));
     assert_eq!(encode_key(&key(KeyCode::Tab, KeyModifiers::NONE), false), Some(b"\t".to_vec()));
     assert_eq!(encode_key(&key(KeyCode::Tab, KeyModifiers::SHIFT), false), Some(b"\x1b[Z".to_vec()));
     assert_eq!(encode_key(&key(KeyCode::BackTab, KeyModifiers::NONE), false), Some(b"\x1b[Z".to_vec()));
@@ -574,6 +589,18 @@ fn encode_mouse_legacy_encoding_and_clamp() {
     assert_eq!(encode_mouse(&down, 500, 500, &m), Some(vec![0x1b, b'[', b'M', 32, 255, 255]));
 }
 
+#[test]
+fn encode_mouse_utf8_encodes_wide_positions_as_characters() {
+    let m = modes(MouseProtocolMode::PressRelease, MouseProtocolEncoding::Utf8);
+    let down = mouse(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE);
+    // Small positions are the legacy bytes.
+    assert_eq!(encode_mouse(&down, 0, 0, &m), Some(vec![0x1b, b'[', b'M', 32, 33, 33]));
+    // Column 100 → value 133 → U+0085 as two UTF-8 bytes; the report stays valid UTF-8.
+    let wide = encode_mouse(&down, 100, 2, &m).expect("encoded");
+    assert_eq!(wide, [&b"\x1b[M "[..], "\u{85}".as_bytes(), b"#"].concat());
+    assert!(std::str::from_utf8(&wide).is_ok());
+}
+
 // ── session persistence ──────────────────────────────────────────────────────
 
 fn sample_states() -> Vec<TabState> {
@@ -615,6 +642,32 @@ fn session_roundtrip_preserves_everything() {
         let text = std::fs::read_to_string(session_path().expect("path")).expect("file");
         assert!(text.starts_with(COPY_OFF_LINE), "the setting line leads the file: {text:?}");
     });
+}
+
+#[test]
+fn session_file_and_folder_are_private_whatever_the_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    with_state_home(dir.path(), || {
+        save_session(&Session { tabs: sample_states(), copy_mode: true });
+        let path = session_path().expect("path");
+        let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "commands can carry secrets");
+        assert_eq!(mode(path.parent().expect("dir")), 0o700);
+    });
+}
+
+#[test]
+fn shells_are_marked_as_running_inside_ricon() {
+    // A ricon started in a tab must know it is nested (see `nested`).
+    let dir = std::env::current_dir().expect("cwd");
+    let shell = test_shell(&dir);
+    assert!(wait_for(|| shell.activity.load(Ordering::Relaxed) > 0, Duration::from_secs(10)), "prompt");
+    shell.send(b"echo NESTED_${RICON:+yes}\r");
+    assert!(
+        wait_for(|| screen_contents(&shell).contains("NESTED_yes"), Duration::from_secs(10)),
+        "RICON is set in the shell's environment"
+    );
 }
 
 #[test]
@@ -1279,6 +1332,18 @@ fn copy_mode_selects_over_an_app_that_grabbed_the_mouse_by_default() {
         wait_for(|| screen_contents(app.tabs[0].active_shell()) != before, Duration::from_secs(10)),
         "the press was forwarded to the app"
     );
+}
+
+#[test]
+fn double_click_keeps_a_wide_character_word_whole() {
+    // A wide glyph's right half is a continuation cell; read as a blank it
+    // split every CJK word after its first character.
+    let app = test_app(&[1]);
+    let shell = app.tabs[0].active_shell();
+    shell.parser.lock().expect("parser").process("\x1b[20;1H日本語 abc".as_bytes());
+    let chars = shell.row_chars(19, 20);
+    assert_eq!(word_span(&chars, 3), (0, 5), "all three glyphs, six cells");
+    assert_eq!(word_span(&chars, 8), (7, 9), "the ASCII word beside it is unchanged");
 }
 
 #[test]
@@ -2164,6 +2229,28 @@ fn mouse_drag_reorders_tabs() {
     app.on_mouse(event(MouseEventKind::Up(MouseButton::Left), 6)).expect("drop");
     assert_eq!((app.tabs[0].shells[0].pid, app.tabs[1].shells[0].pid), (c1, c0), "tabs swapped");
     assert_eq!(app.active, 1, "selection follows the dragged tab");
+}
+
+#[test]
+fn mouse_drag_keeps_favorites_a_block_on_top() {
+    // Kata app.md: favorites cluster on top. A drag must not break the block.
+    let mut app = test_app(&[1, 1, 1]);
+    app.tabs[0].favorite = true;
+    let pid = |app: &App, i: usize| app.tabs[i].shells[0].pid;
+    let (fav, plain) = (pid(&app, 0), pid(&app, 2));
+    let event = |kind, row| MouseEvent { kind, column: 3, row, modifiers: KeyModifiers::NONE };
+    // Tabs start at rows 2, 6, 10. Drag the plain last tab onto the favorite.
+    app.on_mouse(event(MouseEventKind::Down(MouseButton::Left), 10)).expect("grab plain tab");
+    app.on_mouse(event(MouseEventKind::Drag(MouseButton::Left), 2)).expect("drag onto favorite");
+    app.on_mouse(event(MouseEventKind::Up(MouseButton::Left), 2)).expect("drop");
+    assert_eq!(pid(&app, 0), fav, "the favorite keeps the top");
+    assert_eq!(pid(&app, 1), plain, "the plain tab stops right below the favorites");
+    // And the favorite cannot be dragged below a plain tab.
+    app.on_mouse(event(MouseEventKind::Down(MouseButton::Left), 2)).expect("grab favorite");
+    app.on_mouse(event(MouseEventKind::Drag(MouseButton::Left), 10)).expect("drag to the bottom");
+    app.on_mouse(event(MouseEventKind::Up(MouseButton::Left), 10)).expect("drop");
+    assert_eq!(pid(&app, 0), fav, "the favorite stays in its block");
+    assert!(app.tabs[0].favorite && !app.tabs[1].favorite && !app.tabs[2].favorite);
 }
 
 #[test]

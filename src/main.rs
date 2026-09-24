@@ -52,6 +52,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(30);
 /// Ceiling on one drain pass, so an unbroken flood of events (an app in
 /// any-motion mouse mode under a moving cursor) can never starve the redraw.
 const DRAIN_BUDGET: Duration = Duration::from_millis(8);
+/// With nothing happening — no input, no output, nothing animating — a frame
+/// is drawn only this often: enough for the clocks the screen shows (the
+/// countdown, a process that changed in the 2 Hz sample) to stay current,
+/// without rebuilding an unchanged screen 33 times a second.
+const IDLE_FRAME: Duration = Duration::from_millis(250);
 /// How long the "✓ copied" footer hint lingers after a copy to the clipboard.
 const COPY_HINT: Duration = Duration::from_millis(1200);
 /// Clicks landing on the same cell within this window chain into a double
@@ -167,6 +172,15 @@ const PING_AFTER_SCREEN: Duration = Duration::from_secs(60);
 /// readline, which is why `sh` looked fine while `bash` did not.
 const HOST_TERMINAL_VARS: &[&str] =
     &["VTE_VERSION", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "COLUMNS", "LINES"];
+/// Set in every shell ricon spawns, to its version.
+const NESTED_VAR: &str = "RICON";
+
+/// Is this ricon running inside another one? Then it neither restores nor
+/// saves the session. Never under `cargo test`, which may itself be run from
+/// a ricon tab.
+fn nested() -> bool {
+    !cfg!(test) && std::env::var_os(NESTED_VAR).is_some()
+}
 /// How often a transcribed shell's console is walked onto disk while it is
 /// quiet — the reader thread covers everything that arrives, this covers the
 /// stretch after the last byte (kata ai.md).
@@ -465,6 +479,9 @@ impl Shell {
         for var in HOST_TERMINAL_VARS {
             cmd.env_remove(var);
         }
+        // Marks every shell as running inside ricon (as `TMUX` does for tmux):
+        // scripts can tell, and a ricon started in here knows it is nested.
+        cmd.env(NESTED_VAR, env!("CARGO_PKG_VERSION"));
         cmd.cwd(cwd);
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
@@ -671,12 +688,20 @@ impl Shell {
 
     /// Visible grid row `row` as one char per column (a blank cell reads as a
     /// space), so a column index maps straight to a character — what
-    /// double-click word expansion walks.
+    /// double-click word expansion walks. The right half of a wide character
+    /// repeats it: read as a blank, it split every CJK word after one glyph.
     fn row_chars(&self, row: u16, cols: u16) -> Vec<char> {
         let parser = self.parser.lock().unwrap_or_else(PoisonError::into_inner);
         let screen = parser.screen();
+        let mut last = ' ';
         (0..cols)
-            .map(|c| screen.cell(row, c).and_then(|cell| cell.contents().chars().next()).unwrap_or(' '))
+            .map(|c| {
+                let cell = screen.cell(row, c);
+                if !cell.is_some_and(vt100::Cell::is_wide_continuation) {
+                    last = cell.and_then(|cell| cell.contents().chars().next()).unwrap_or(' ');
+                }
+                last
+            })
             .collect()
     }
 
@@ -726,9 +751,12 @@ impl Shell {
     /// Advance the activity animation: the phase moves whenever output
     /// arrived since the last tick; it stops shortly after output settles.
     /// Output arriving while inactive sets the unseen marker; focus clears it.
-    fn tick_activity(&mut self, is_active: bool) {
+    /// Returns whether output arrived since the last tick — the screen then
+    /// needs a fresh frame.
+    fn tick_activity(&mut self, is_active: bool) -> bool {
         let now = self.activity.load(Ordering::Relaxed);
-        if now != self.seen_activity {
+        let fresh = now != self.seen_activity;
+        if fresh {
             self.seen_activity = now;
             if self.resized.elapsed() > RESIZE_GRACE {
                 self.last_change = Instant::now();
@@ -749,6 +777,7 @@ impl Shell {
             self.unseen_output = false;
         }
         self.animating = self.last_change.elapsed() < SETTLE;
+        fresh
     }
 
     /// Has the visible screen changed since this was last asked? Hashing keeps
@@ -1276,7 +1305,8 @@ struct Selection {
 /// blocking IO that used to land on a frame twice a second. The UI posts the
 /// shell pid it wants resolved and picks the answer up whenever it is ready.
 struct AgentProbe {
-    ask: mpsc::Sender<u32>,
+    /// A shell pid to resolve, with the agent pid last found in it (if any).
+    ask: mpsc::Sender<(u32, Option<u32>)>,
     answers: mpsc::Receiver<(u32, Option<AgentInfo>)>,
     /// A request is out; only one at a time, so a slow probe can never pile up.
     pending: bool,
@@ -1285,11 +1315,11 @@ struct AgentProbe {
 
 impl AgentProbe {
     fn spawn() -> Self {
-        let (ask, requests) = mpsc::channel::<u32>();
+        let (ask, requests) = mpsc::channel::<(u32, Option<u32>)>();
         let (reply, answers) = mpsc::channel();
         thread::spawn(move || {
-            while let Ok(shell) = requests.recv() {
-                let model = detect_agent(shell).map(|(spec, pid)| Probe::new(pid).agent(spec));
+            while let Ok((shell, prior)) = requests.recv() {
+                let model = detect_agent(shell, prior).map(|(spec, pid)| Probe::new(pid).agent(spec));
                 if reply.send((shell, model)).is_err() {
                     break;
                 }
@@ -1386,6 +1416,13 @@ struct App {
     /// Last frame drawn — the app renders at most once per `POLL_INTERVAL` and
     /// spends the rest of the budget draining input.
     drawn: Instant,
+    /// Last pass of the per-frame ticks (activity, sampling, nudges). They run
+    /// every `POLL_INTERVAL`; the draw after them only when `dirty` or the
+    /// `IDLE_FRAME` is up.
+    ticked: Instant,
+    /// Something changed the screen since the last frame: an event was handled
+    /// or a shell produced output.
+    dirty: bool,
     /// Set by confirming the quit dialog; the loop then shuts every shell
     /// down and exits.
     quit: bool,
@@ -1465,6 +1502,8 @@ impl App {
             agent_probe: AgentProbe::spawn(),
             agent_cursor: 0,
             drawn: stale(POLL_INTERVAL),
+            ticked: stale(POLL_INTERVAL),
+            dirty: true,
             quit: false,
             confirm_quit: None,
             help: false,
@@ -1557,7 +1596,8 @@ impl App {
             // Everything below is per frame, not per wake: a burst of events
             // wakes the loop far more often than it draws, and the /proc
             // sampling and ticks are budgeted for one pass a frame.
-            if self.drawn.elapsed() >= POLL_INTERVAL {
+            if self.ticked.elapsed() >= POLL_INTERVAL {
+                self.ticked = Instant::now();
                 // The filtered tab list drives everything below (reveal, render,
                 // hit-testing); tabs may have been added, closed or reaped.
                 self.refresh_shown();
@@ -1574,7 +1614,7 @@ impl App {
                         // Only the active tab's active shell is on screen; every
                         // other shell's output is "unseen" until it is focused.
                         let on_screen = ti == active_tab && si == shown;
-                        shell.tick_activity(on_screen);
+                        self.dirty |= shell.tick_activity(on_screen) || shell.animating;
                         shell.tick_ping(on_screen);
                         shell.flush_pending();
                     }
@@ -1595,18 +1635,24 @@ impl App {
                 self.persist_session();
                 self.fit_ptys(terminal.size()?.into());
                 self.drop_stale_selection();
-                terminal.draw(|frame| draw(frame, self))?;
-                self.drawn = Instant::now();
+                // The copy hint has to vanish on time, not up to a frame late.
+                let hint = self.copied_at.is_some_and(|t| t.elapsed() < COPY_HINT + POLL_INTERVAL);
+                if self.dirty || hint || self.drawn.elapsed() >= IDLE_FRAME {
+                    terminal.draw(|frame| draw(frame, self))?;
+                    self.drawn = Instant::now();
+                    self.dirty = false;
+                }
             }
             // Spend the rest of the frame waiting for input, then handle
             // everything the host has already queued before drawing again. A
             // burst (mouse motion under an any-motion app, a large paste) then
             // costs one frame instead of one full render per event — rendering
             // per event is what made ricon freeze under the cursor.
-            if !event::poll(POLL_INTERVAL.saturating_sub(self.drawn.elapsed()))? {
+            if !event::poll(POLL_INTERVAL.saturating_sub(self.ticked.elapsed()))? {
                 continue;
             }
             let deadline = Instant::now() + DRAIN_BUDGET;
+            self.dirty = true;
             loop {
                 self.handle(event::read()?)?;
                 // Stop draining when the app is going away (the state the rest
@@ -1648,6 +1694,7 @@ impl App {
             self.agent_probe.pending = false;
             for shell in self.tabs.iter_mut().flat_map(|t| t.shells.iter_mut()) {
                 if shell.pid == Some(pid) {
+                    self.dirty |= shell.agent != agent; // a new model or usage for the footer
                     shell.set_agent(agent.clone());
                 }
             }
@@ -1656,8 +1703,16 @@ impl App {
             return;
         }
         let Some(pid) = self.next_probe_target() else { return };
+        // The agent found there last time lets the probe confirm it with a few
+        // reads instead of searching the shell's process tree again.
+        let prior = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.shells.iter())
+            .find(|s| s.pid == Some(pid))
+            .and_then(|s| s.agent.as_ref().map(|a| a.pid));
         self.agent_probe.asked = Instant::now();
-        self.agent_probe.pending = self.agent_probe.ask.send(pid).is_ok();
+        self.agent_probe.pending = self.agent_probe.ask.send((pid, prior)).is_ok();
     }
 
     /// Next shell pid to resolve an agent for: the on-screen one on even turns,
@@ -2105,7 +2160,17 @@ impl App {
             // carrying the active selection with it.
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_tab.is_some() => {
                 let from = self.dragging_tab.unwrap_or(0);
-                if let Some(to) = self.tab_at_row(mouse.row)
+                // A tab moves only within its own block: favorites stay one
+                // contiguous group on top (kata app.md), so a favorite never
+                // lands below a plain tab, nor a plain tab among the favorites.
+                let favorites = self.tabs.iter().filter(|t| t.favorite).count();
+                let block = match self.tabs.get(from) {
+                    Some(tab) if tab.favorite => 0..favorites,
+                    _ => favorites..self.tabs.len(),
+                };
+                if let Some(to) = self
+                    .tab_at_row(mouse.row)
+                    .map(|to| to.clamp(block.start, block.end.saturating_sub(1).max(block.start)))
                     && from < self.tabs.len()
                     && to < self.tabs.len()
                     && to != from
@@ -2385,7 +2450,11 @@ impl App {
     /// close is visible without waiting on the 10-Hz throttle.
     fn close_active(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            let _ = tab.active_shell_mut().child.kill();
+            let shell = tab.active_shell_mut();
+            // Seal the transcript first, as quitting does: an agent that
+            // clears its screen on the way out must not erase its last answer.
+            shell.finish_log();
+            let _ = shell.child.kill();
         }
         self.reaped = stale(Duration::from_secs(1));
         self.reap_dead_tabs();
@@ -2554,6 +2623,7 @@ impl App {
         let cols = area.width - self.sidebar_width;
         if (rows, cols) != (self.pty_rows, self.pty_cols) {
             (self.pty_rows, self.pty_cols) = (rows, cols);
+            self.dirty = true;
             self.selection = None; // grid reflowed — old cell coords are stale
             for tab in &mut self.tabs {
                 tab.resize(rows, cols);
@@ -2876,17 +2946,67 @@ fn copy_button_x(width: u16) -> Option<(u16, u16)> {
 }
 
 /// First known agent process descending from `shell_pid`, with its spec.
-/// One `/proc` scan for all agents (reads each comm once, walks ppid chains
-/// only for the rare comm matches). The `/proc/<pid>/children` file is
-/// unreliable (often empty), so a downward tree walk would miss agents
-/// launched behind a wrapper (e.g. `ollama launch opencode`).
-fn detect_agent(shell_pid: u32) -> Option<(&'static AgentSpec, u32)> {
-    std::fs::read_dir("/proc").ok()?.flatten().find_map(|entry| {
-        let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-        let comm = proc_comm(pid)?;
-        let spec = AGENTS.iter().find(|s| s.comm == comm)?;
-        descends_from(pid, shell_pid).then_some((spec, pid))
-    })
+///
+/// Cheapest answer first, because this runs twice a second forever:
+/// 1. `prior` — the agent found last time — when it still runs under this
+///    shell: a handful of reads, and the session stays the same one;
+/// 2. the shell's own process tree, walked down through every thread's
+///    `children` file (`/proc/<pid>/children` alone lists one thread's, which
+///    is why it looked unreliable) — tens of reads instead of one per process
+///    on the machine, and it still finds an agent behind a wrapper
+///    (`ollama launch opencode`);
+/// 3. a scan of all of `/proc`, only on a kernel without those files.
+fn detect_agent(shell_pid: u32, prior: Option<u32>) -> Option<(&'static AgentSpec, u32)> {
+    if let Some(pid) = prior
+        && let Some(spec) = agent_spec(pid)
+        && descends_from(pid, shell_pid)
+    {
+        return Some((spec, pid));
+    }
+    match descendants(shell_pid) {
+        Some(tree) => tree.into_iter().find_map(|pid| agent_spec(pid).map(|spec| (spec, pid))),
+        None => std::fs::read_dir("/proc").ok()?.flatten().find_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let spec = agent_spec(pid)?;
+            descends_from(pid, shell_pid).then_some((spec, pid))
+        }),
+    }
+}
+
+/// The agent spec whose process name `pid` runs under, if any.
+fn agent_spec(pid: u32) -> Option<&'static AgentSpec> {
+    let comm = proc_comm(pid)?;
+    AGENTS.iter().find(|s| s.comm == comm)
+}
+
+/// Every process below `root`, nearest first — `None` when the kernel keeps no
+/// `children` files (built without `CONFIG_PROC_CHILDREN`), so the caller
+/// falls back to scanning all of `/proc`. Capped, so no tree can make it run
+/// away.
+fn descendants(root: u32) -> Option<Vec<u32>> {
+    const MAX: usize = 4096;
+    let mut tree = proc_children(root)?;
+    let mut next = 0;
+    while next < tree.len() && tree.len() < MAX {
+        let kids = proc_children(tree[next]).unwrap_or_default();
+        tree.extend(kids);
+        next += 1;
+    }
+    Some(tree)
+}
+
+/// Direct children of `pid`: the union of its threads' `children` files, since
+/// each lists only the processes that thread forked. `None` when not one of
+/// them could be read (gone, or no such files on this kernel).
+fn proc_children(pid: u32) -> Option<Vec<u32>> {
+    let mut read_any = false;
+    let mut kids = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()?.flatten() {
+        let Ok(text) = std::fs::read_to_string(task.path().join("children")) else { continue };
+        read_any = true;
+        kids.extend(text.split_whitespace().filter_map(|p| p.parse::<u32>().ok()));
+    }
+    read_any.then_some(kids)
 }
 
 /// Whether `pid` has `target` as an ancestor (walking ppid chains, capped).
@@ -3419,7 +3539,7 @@ fn tab_item(index: usize, tab: &Tab, is_active: bool, width: u16) -> ListItem<'s
         _ => format!(" {}", truncate_tail(&folder, budget as u16, 1)),
     };
     // Blanks between the last indicator and the button's fixed column.
-    let gap = " ".repeat(limit.saturating_sub(margins + name.chars().count()));
+    let gap = " ".repeat(limit.saturating_sub(margins + name.width()));
     // The active shell within a multi-shell tab is flagged with ▶ on its path
     // row, indented two spaces so it nests under the tab-level ▶ (rule: "active
     // shell shows ▶ … with two prefix spaces"); single-shell tabs rely on the
@@ -3562,7 +3682,7 @@ fn replay_row(shell: &Shell, bar: &str, width: u16, style: Style) -> Option<Line
 /// layout in `replay_row`.
 fn replay_span(shell: &Shell, width: u16) -> std::ops::Range<usize> {
     let cmd = shell.last_cmd.as_deref().unwrap_or_default();
-    let end = REPLAY_PAD as usize + truncate_head(cmd, width, REPLAY_PAD + 1).chars().count();
+    let end = REPLAY_PAD as usize + truncate_head(cmd, width, REPLAY_PAD + 1).width();
     REPLAY_ICON_COL..end.max(REPLAY_ICON_COL + REPLAY_COLS)
 }
 
@@ -3609,17 +3729,30 @@ fn folder_name(p: &Path) -> String {
 /// never exceeds the budget — the `…` costs one of the kept columns, so a row
 /// that reserves exactly this much can't spill into what follows it (the auto
 /// button, the panel border).
+///
+/// Budgets are terminal cells, not characters: a wide (CJK, emoji) character
+/// takes two, and counting it as one pushed everything after it off its column.
 fn truncate_tail(s: &str, width: u16, pad: u16) -> String {
-    let count = s.chars().count();
     let max = width.saturating_sub(pad) as usize;
     match max {
         // No columns left at all: the `…` would itself be the overflow, and a
         // caller that budgeted nothing must get nothing — a row laid out from
         // these widths puts what follows straight after.
         0 => String::new(),
-        _ if count > max => std::iter::once('…').chain(s.chars().skip(count + 1 - max)).collect(),
+        _ if s.width() > max => {
+            let mut used = 1; // the `…`
+            let mut tail: Vec<char> = s.chars().rev().take_while(|c| fits(&mut used, *c, max)).collect();
+            tail.push('…');
+            tail.into_iter().rev().collect()
+        }
         _ => s.to_string(),
     }
+}
+
+/// Add `c`'s cell width to `used`; whether it still fits within `max`.
+fn fits(used: &mut usize, c: char, max: usize) -> bool {
+    *used += c.width().unwrap_or(0);
+    *used <= max
 }
 
 /// Head-truncate `s` to the sidebar width, leaving `pad` columns for the prefix;
@@ -3629,7 +3762,10 @@ fn truncate_head(s: &str, width: u16, pad: u16) -> String {
     let max = width.saturating_sub(pad) as usize;
     match max {
         0 => String::new(), // nothing budgeted, nothing rendered — as `truncate_tail`
-        _ if s.chars().count() > max => s.chars().take(max - 1).chain(std::iter::once('…')).collect(),
+        _ if s.width() > max => {
+            let mut used = 1; // the `…`
+            s.chars().take_while(|c| fits(&mut used, *c, max)).chain(std::iter::once('…')).collect()
+        }
         _ => s.to_string(),
     }
 }
@@ -3687,6 +3823,9 @@ fn session_path() -> Option<PathBuf> {
 /// The session as last saved: its tabs in order, each with its shells (none
 /// if nothing was saved), and the copy-mode setting.
 fn load_session() -> Session {
+    if nested() {
+        return Session::default(); // see `save_session`
+    }
     let text = session_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     let mut tabs: Vec<TabState> = Vec::new();
     let copy_mode = !text.lines().any(|l| l == COPY_OFF_LINE);
@@ -3745,10 +3884,32 @@ fn one_line(s: &str) -> String {
     s.replace(['\n', '\r', '\t'], " ")
 }
 
+/// Create `dir` and any missing parents as owner-only (0700), whatever the
+/// umask: what ricon keeps — commands, AI session transcripts — can carry
+/// secrets, and a permissive umask must not hand them to other users.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+}
+
+/// Options that create a file owner-only (0600), whatever the umask — see
+/// `private_dir`.
+fn private_file() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.mode(0o600);
+    options
+}
+
 fn save_session(session: &Session) {
+    // A ricon inside ricon keeps no session: it would replay itself on every
+    // restart, and fight the outer one over the same file.
+    if nested() {
+        return;
+    }
     let Some(path) = session_path() else { return };
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        let _ = private_dir(dir);
     }
     let mut body: Vec<String> = Vec::new();
     if !session.copy_mode {
@@ -3786,7 +3947,13 @@ fn save_session(session: &Session) {
     // on the UI thread, and a rename over the old file is flushed by the
     // filesystem's own replace-on-rename handling.)
     let staged = path.with_extension("new");
-    if std::fs::write(&staged, body.join("\n")).is_ok() {
+    let written = private_file()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&staged)
+        .and_then(|mut file| file.write_all(body.join("\n").as_bytes()));
+    if written.is_ok() {
         let _ = std::fs::rename(&staged, &path);
     } else {
         let _ = std::fs::remove_file(&staged);
@@ -3970,6 +4137,9 @@ fn encode_key(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
         KeyCode::Char(c) if ctrl && c.is_ascii() => vec![ctrl_byte(c)],
         KeyCode::Char(c) => c.to_string().into_bytes(),
         KeyCode::Enter => vec![b'\r'],
+        // xterm: Ctrl+Backspace is ^H, which readline and editors bind apart
+        // from a plain Backspace (DEL).
+        KeyCode::Backspace if ctrl => vec![0x08],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab if shift => b"\x1b[Z".to_vec(),
         KeyCode::Tab => vec![b'\t'],
@@ -4264,8 +4434,20 @@ fn encode_mouse(mouse: &MouseEvent, col: u16, row: u16, modes: &TermModes) -> Op
             let suffix = if press { 'M' } else { 'm' };
             format!("\x1b[<{cb};{};{}{suffix}", col + 1, row + 1).into_bytes()
         }
-        // Legacy (and utf8) encoding: release loses the button identity.
-        _ => {
+        // UTF-8 (mode 1005): the legacy layout, but each value past 127 is
+        // written as a UTF-8 character — raw bytes there are invalid UTF-8,
+        // and positions reach 2015 instead of 223.
+        MouseProtocolEncoding::Utf8 => {
+            let cb = if press { cb } else { 3 };
+            let mut out = b"\x1b[M".to_vec();
+            for value in [u32::from(cb) + 32, 33 + u32::from(col.min(2014)), 33 + u32::from(row.min(2014))] {
+                let c = char::from_u32(value).unwrap_or(' ');
+                out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+            }
+            out
+        }
+        // Legacy encoding: release loses the button identity.
+        MouseProtocolEncoding::Default => {
             let cb = if press { cb } else { 3 };
             // Coordinate byte is 32 + 1-based position, capped at 255 — the
             // largest position legacy encoding can express is 223.
