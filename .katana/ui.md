@@ -4,12 +4,12 @@
 
 
 ## Selection & clipboard
-- left-drag in the terminal pane selects text; the selected cells are painted in the selection color (never merely reversed — a reversal cancels itself out over text that is already inverse)
+- left-drag in the terminal pane selects a block (rectangle): only the dragged columns on each row, copied row by row joined by newlines; the selected cells are painted in the selection color (never merely reversed — a reversal cancels itself out over text that is already inverse)
 - the selection is confined to the pane grid (dragging into the sidebar clamps to its first column) — sidebar/tab text is never selected or copied
 - the pane's first column starts a selection; the sidebar resize handle stays inside the sidebar
 - double-click selects the word under the cursor and copies it — a word keeps the punctuation that holds paths, URLs, flags and identifiers together; triple-click takes the whole logical line, soft-wrapped continuations included
 - releasing the drag copies the selection to the clipboard and to the primary selection
-- Ctrl+C and Esc are never shadowed: they always reach the shell; with a selection live they take the highlight down on their way through (the release already copied)
+- Ctrl+C and Esc are never shadowed (Esc only while the search row has focus — see Search row): they always reach the shell; with a selection live they take the highlight down on their way through (the release already copied)
 - the copy goes out over both routes: OSC 52 (ssh/tmux/kitty/wezterm) and the local X11/Wayland clipboard + primary selection (gnome-terminal and other VTE terminals ignore OSC 52)
 - a middle click in the pane pastes the primary selection into the shell (bracketed when the app asked for bracketed paste), as every terminal does — ricon holds the mouse, so the host terminal cannot
 - Alt+a selects the whole visible screen and copies it — "copy everything" is always drawn as a selection first, never taken behind the user's back
@@ -33,7 +33,9 @@
 ## Search row
 - before all tabs, there is one search line that filters tabs based on input
 - search row can be selected by mouse
-- search row can be selected by Alt+f
+- search row can be selected by Ctrl+f
+- Esc in the search row cancels the search: the filter is cleared, focus returns to the shell, and the key is consumed (an agent must not see it as an interrupt); Enter keeps the filter
+- clicking the pane hands typing back to the shell
 - search row has focus when app is started so after app start user can type in search immediately
 - when tabs are filtered, tab-switching (Alt+PageUp/Down, Alt+1–9) considers only visible (filtered) tabs
 

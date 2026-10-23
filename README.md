@@ -13,7 +13,7 @@ A fast terminal console with **vertical tabs** — built with [ratatui](https://
 │ 2 ⭐web *│
 │   ~/code/web
 │   └ vite │
-└──────────┘ 1/2 ▸ ~/code/gen/ricon  ⎇ main  ✳ claude-opus-5 93k/1M  ⧉ copy ✓ v0.4.2
+└──────────┘ 1/2 ▸ ~/code/gen/ricon  ⎇ main  ✳ claude-opus-5 93k/1M  ⧉ copy ✓ v0.4.3
 ```
 
 ## Features
@@ -21,9 +21,9 @@ A fast terminal console with **vertical tabs** — built with [ratatui](https://
 - 🗂️ **Vertical tabs** — entries show folder, full path, running process + activity spinner.
 - 🐚 **Subshells** — `Alt+s` adds extra shells to a tab; they move with it and add their own path/process rows.
 - ⭐ **Favorites** — `Alt+Shift+f` pins a tab into the favorites block at the top of the sidebar.
-- 🔎 **Search** — a search row above the tabs (focused at start, or `Alt+f`) filters tabs by path as you type.
+- 🔎 **Search** — a search row above the tabs (focused at start, or `Ctrl+f`) filters tabs by path as you type; `Esc` clears it, `Enter` keeps it.
 - ⏵ **Replay** — a red `replay` button beside each process re-runs the shell's last command on click or `Alt+r`.
-- 📋 **Select, copy & paste** — drag to select text in the terminal pane (pane content only, never the sidebar); releasing copies it to the system clipboard *and* the primary selection. Double-click takes the word under the cursor (a whole path or URL, not one segment), triple-click the whole line, `Alt+a` the whole visible screen. A selection covers text, not screen cells: wheel while dragging to stretch it over as many screens as you like. Middle-click pastes the primary selection, as in any terminal. The copy goes out both as OSC 52 (ssh/tmux/kitty/wezterm) and to the local X11/Wayland clipboard, so it also lands under gnome-terminal & friends, which ignore OSC 52. `Ctrl+c` and `Esc` are never taken from the shell.
+- 📋 **Select, copy & paste** — drag to select a block (rectangle) of text in the terminal pane — only the columns you drag over, not whole rows (pane content only, never the sidebar); releasing copies it to the system clipboard *and* the primary selection. Double-click takes the word under the cursor (a whole path or URL, not one segment), triple-click the whole line, `Alt+a` the whole visible screen. A selection covers text, not screen cells: wheel while dragging to stretch it over as many screens as you like. Middle-click pastes the primary selection, as in any terminal. The copy goes out both as OSC 52 (ssh/tmux/kitty/wezterm) and to the local X11/Wayland clipboard, so it also lands under gnome-terminal & friends, which ignore OSC 52. `Ctrl+c` and `Esc` are never taken from the shell (except `Esc` in the search row).
 - 🎯 **Copy mode** — on by default, shown as **⧉ copy ✓** in the status bar: even over an app that grabbed the mouse (a coding agent, vim, less, htop) a plain drag selects and a middle click pastes, while the wheel and the other buttons still reach the app. Click the button or press `Alt+c` to switch it off (**⧉ copy ✗**) and hand the whole mouse to the app — the choice is remembered. With it off, hold **Alt** while dragging for a one-off selection. (Most host terminals keep `Shift`+drag for their own selection, which spans the whole window — sidebar text included — so reach for copy mode or Alt instead.)
 - 🎨 **One pastel, and an activity bar** — the active tab (and the status bar) wear a soft pastel with dark text; every other tab draws in the terminal's own colors. The active tab's last row is a bar with a lit segment sweeping along it while output streams, still while the tab is quiet.
 - 💾 **Session persistence** — reopens tabs, subshells, favorites and the active selection at their folders, replaying the command that was running in each shell.
@@ -70,7 +70,7 @@ ricon ~/code     # base path = given directory; the first shell starts here
 | `Alt+Up` / `Alt+Down` | Previous / next shell within the tab |
 | `Alt+w` | Close active shell (its tab closes with the last shell) |
 | `Alt+Shift+f` | Toggle favorite (⭐, pinned to the top) |
-| `Alt+f` | Focus the search row (filter tabs by path) |
+| `Ctrl+f` | Focus the search row (filter tabs by path; `Esc` clears) |
 | `Alt+r` | Replay the shell's last command |
 | `Alt+q` | Quit gracefully |
 | `Alt+1` … `Alt+9` | Select tab by number |
@@ -79,14 +79,14 @@ ricon ~/code     # base path = given directory; the first shell starts here
 | Click / drag a tab | Select tab & shell / reorder |
 | Wheel over sidebar | Scroll the tab list |
 | Wheel over pane | Scroll terminal history |
-| Drag in pane | Select pane text → clipboard (with copy mode off: `Alt`+drag over mouse-driven apps) |
+| Drag in pane | Select a block (rectangle) of pane text → clipboard (with copy mode off: `Alt`+drag over mouse-driven apps) |
 | Double / triple click in pane | Select the word / the whole line, and copy it |
 | Middle click in pane | Paste the primary selection |
 | `Alt+c` / click `⧉ copy ✓` | Switch copy mode off (mouse-driven apps get the whole mouse) and back on |
 | `Alt+a` | Select the whole visible screen and copy it |
 | `Alt+?` / `Alt+h` | Cheat sheet with every shortcut |
 
-Every shortcut of ricon's own is a bare `Alt` chord, so every `Ctrl` key — `Ctrl+c` included — and every `Ctrl+Alt` chord reaches the shell untouched.
+Every shortcut of ricon's own is a bare `Alt` chord (plus `Ctrl+f` for search), so every other `Ctrl` key — `Ctrl+c` included — and every `Ctrl+Alt` chord reaches the shell untouched.
 
 ## How it works
 

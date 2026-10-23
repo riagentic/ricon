@@ -9,7 +9,7 @@
 - tabs are vertical 
 - tab states terminal number (starting by 1) and location (path) of the first shell
 - new shell can be triggered by alt+t or alt+n
-- all shortcuts of ricon's own are on alt (alt+t/alt+n new tab, alt+w close shell, alt+f search, alt+shift+f favorite, alt+q quit, alt+s subshell, alt+r replay, alt+c copy mode, alt+a select all, alt+? help); ctrl keys are never taken from the shell
+- all shortcuts of ricon's own are on alt (alt+t/alt+n new tab, alt+w close shell, alt+shift+f favorite, alt+q quit, alt+s subshell, alt+r replay, alt+c copy mode, alt+a select all, alt+? help); the one exception is ctrl+f (search) — every other ctrl key reaches the shell
 - alt+? (or alt+h) shows a centered cheat sheet listing every shortcut; any key or click closes it and reaches nothing else
 - tab can be selected also by alt+terminal number (for example alt+1 and alt+KP 1)
 - terminal can be selected by clicking mouse on the tab 
@@ -62,7 +62,7 @@
 - Alt+q opens a centered confirmation dialog "Are you sure to Quit all tabs?" with YES and NO buttons
 - the quit dialog preselects NO; arrows toggle YES/NO, Enter confirms, Esc cancels — only YES quits the app gracefully
 - the quit dialog is modal: keys, mouse and paste don't reach the shells while it is open
-- every ricon shortcut is a bare Alt chord: Ctrl+Alt chords (Emacs/readline C-M- bindings) and every Ctrl key reach the shell
+- every ricon shortcut is a bare Alt chord (plus Ctrl+f for search): Ctrl+Alt chords (Emacs/readline C-M- bindings) and every other Ctrl key reach the shell
 
 ## Tab
 - first row of the tab is current folder name 

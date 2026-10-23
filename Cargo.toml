@@ -1,6 +1,6 @@
 [package]
 name = "ricon"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 rust-version = "1.88"
 description = "A fast terminal console with vertical tabs — per-tab shells, session persistence, and live AI-agent model detection."
@@ -16,6 +16,12 @@ exclude = ["/.katana", "/.github", "/target"]
 [dependencies]
 # Desktop clipboard (X11/Wayland). No image support — text only.
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
+# Not used directly (ratatui re-exports it): only switches the Unix input
+# backend to level-triggered poll(). The default mio backend is edge-triggered
+# and returns after one parsed event without draining the tty, so a backlog
+# that fills the kernel's 4 KiB input queue never signals again — ricon then
+# ignores every key and click forever.
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 portable-pty = "0.9.0"
 ratatui = "0.30.1"
 rusqlite = { version = "0.32", features = ["bundled"] }

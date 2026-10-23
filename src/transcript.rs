@@ -231,7 +231,7 @@ impl Capture {
     /// left the screen is taken: it is final, whereas the screen is still being
     /// drawn on (that is what the sidecar is for).
     fn scrolled_off(&mut self, screen: &mut vt100::Screen, pushed: Option<usize>) -> Vec<String> {
-        let (rows, cols) = screen.size();
+        let (rows, _) = screen.size();
         if rows == 0 {
             return Vec::new();
         }
@@ -256,7 +256,10 @@ impl Capture {
             // The view at offset `total - next` starts with row `next`.
             screen.set_scrollback(total - next);
             let n = (total - next).min(usize::from(rows));
-            let texts: Vec<String> = screen.rows(0, cols).take(n).collect();
+            // Full width: vt100 never reflows scrollback rows, so a row pushed
+            // before the pane narrowed is wider than `cols` — cut, it would
+            // lose text and its digest would stop matching the anchor.
+            let texts: Vec<String> = screen.rows(0, u16::MAX).take(n).collect();
             for (at, text) in texts.into_iter().enumerate() {
                 if self.anchor.len() == ANCHOR {
                     self.anchor.pop_front();
@@ -423,6 +426,10 @@ impl Transcript {
         }
         inner.meta = Some(meta);
         inner.capture.catch_up = true;
+        // The last session's screen digests mean nothing to this one: left
+        // set, a matching first screen was skipped as already written.
+        inner.capture.snap = 0;
+        inner.capture.tail = 0;
         // Whatever was pushed before the session is history the catch-up
         // takes by the buffer, not by a count.
         self.pushed.store(UNCOUNTED, Ordering::Release);
@@ -689,9 +696,8 @@ fn history(screen: &mut vt100::Screen) -> usize {
 /// Digest of scrollback row `row` (0 = oldest) of a buffer `total` rows long.
 /// Moves the view; the caller restores it.
 fn row_digest(screen: &mut vt100::Screen, total: usize, row: usize) -> Option<u64> {
-    let (_, cols) = screen.size();
     screen.set_scrollback(total - row);
-    screen.rows(0, cols).next().map(|line| digest(&line))
+    screen.rows(0, u16::MAX).next().map(|line| digest(&line)) // full width, as `commit` reads it
 }
 
 /// `lines` without its trailing blank rows — the empty bottom of a screen is

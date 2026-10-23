@@ -19,6 +19,7 @@ use std::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::{
     DefaultTerminal, Frame,
+    backend::{Backend, ClearType},
     crossterm::{
         event::{
             self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -227,8 +228,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     }));
     let result = App::new().and_then(|mut app| app.run(&mut terminal));
     release_host_terminal(enhanced);
+    drain_host_input();
     ratatui::restore();
     result
+}
+
+/// Mouse reports the host sent before it saw capture switched off are still in
+/// flight. Read and drop them while raw mode is on — left in the tty they
+/// spill onto the shell prompt as `^[[<35;…M` garbage once ricon exits.
+fn drain_host_input() {
+    const QUIET: Duration = Duration::from_millis(50);
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline && event::poll(QUIET).unwrap_or(false) {
+        let _ = event::read();
+    }
 }
 
 /// Hand back every host-terminal mode ricon switched on. Idempotent and
@@ -1250,7 +1263,10 @@ impl Drop for Shell {
     /// reader thread then sees EOF and exits on its own.
     fn drop(&mut self) {
         self.finish_log();
-        let _ = self.child.kill();
+        // A reaped child's pid may already belong to another process.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
     }
 }
 
@@ -1284,7 +1300,7 @@ struct Selection {
     /// True while the left button is held — drag extends `head`; release copies.
     dragging: bool,
     /// Block (rectangular) selection: every cell in the rectangle between
-    /// `anchor` and `head`, not reading-order rows. Armed by Shift+Ctrl+drag —
+    /// `anchor` and `head`, not reading-order rows. Every drag is a block —
     /// the way to lift a column of text out of a table or a log. A block
     /// selection is copied with each row's columns joined by a newline, so the
     /// clipboard holds exactly the rectangle that was highlighted.
@@ -1432,6 +1448,11 @@ struct App {
     confirm_quit: Option<bool>,
     /// The shortcut cheat sheet (Alt+?) is up; any key or click takes it down.
     help: bool,
+    /// Shown shell and shell/tab counts at the last frame — see `layout_key`.
+    drawn_layout: (usize, usize, usize, usize),
+    /// Closed shells still sealing their transcript and hanging up, off this
+    /// thread; joined before exit so the last close is never cut short.
+    closing: Vec<thread::JoinHandle<()>>,
 }
 
 /// One persisted shell: its folder and the command running in it (if any).
@@ -1507,6 +1528,8 @@ impl App {
             quit: false,
             confirm_quit: None,
             help: false,
+            drawn_layout: (0, 0, 0, 0),
+            closing: Vec::new(),
         };
         // Until v0.3 the auto feature was app-global in a flag file beside the
         // session; it is per-tab inside the session now — sweep the orphan so
@@ -1578,12 +1601,15 @@ impl App {
                 // to main() which restores the host terminal (mouse, paste,
                 // keyboard flags).
                 self.persist_now();
-                for tab in &mut self.tabs {
-                    for shell in &mut tab.shells {
-                        shell.finish_log();
-                        let _ = shell.child.kill();
-                    }
+                // Hang every shell up at once, as closing a terminal does
+                // (bash saves its history); dropping them below then only waits
+                // on the few that ignore SIGHUP, not 200 ms per shell in turn.
+                for shell in self.tabs.iter_mut().flat_map(|t| t.shells.iter_mut()) {
+                    shell.finish_log();
+                    let _ = shell.child.clone_killer().kill();
                 }
+                self.tabs.clear();
+                self.closing.drain(..).for_each(|h| drop(h.join()));
                 return Ok(());
             }
             if self.tabs.is_empty() {
@@ -1591,6 +1617,7 @@ impl App {
                 // the next start opens fresh instead of resurrecting the tab
                 // the user just closed (the 1 Hz snapshot still contains it).
                 self.persist_now();
+                self.closing.drain(..).for_each(|h| drop(h.join()));
                 return Ok(());
             }
             // Everything below is per frame, not per wake: a burst of events
@@ -1625,8 +1652,10 @@ impl App {
                 // 2-Hz window instead of one O(shells) burst frame — that burst
                 // froze the UI with many tabs.
                 self.sample_shells();
-                // Only the shell whose status bar is on screen needs its AI agent
-                // resolved, and never on this thread — see `AgentProbe`.
+                // Resolve the shells' AI agents off this thread — see
+                // `AgentProbe`. The probe rotates over every shell (the
+                // on-screen one every other turn), so the auto feature sees an
+                // agent in a background tab too.
                 self.tick_agent();
                 // A middle-click paste whose clipboard read has come back.
                 while let Ok(text) = self.pastes.1.try_recv() {
@@ -1637,6 +1666,19 @@ impl App {
                 self.drop_stale_selection();
                 // The copy hint has to vanish on time, not up to a frame late.
                 let hint = self.copied_at.is_some_and(|t| t.elapsed() < COPY_HINT + POLL_INTERVAL);
+                // A tab closed or switched repaints from scratch: the diff
+                // renderer trusts the host's screen to match its last frame, and
+                // glyphs the host draws at another width than unicode-width says
+                // (emoji, symbols) break that — the leftovers stayed on screen.
+                let layout = self.layout_key();
+                if layout != self.drawn_layout {
+                    self.drawn_layout = layout;
+                    // Not `terminal.clear()`: that asks the host for the cursor
+                    // position, a round trip whose reply can land among input.
+                    terminal.backend_mut().clear_region(ClearType::All)?;
+                    terminal.swap_buffers(); // the next frame diffs against a blank screen
+                    self.dirty = true;
+                }
                 if self.dirty || hint || self.drawn.elapsed() >= IDLE_FRAME {
                     terminal.draw(|frame| draw(frame, self))?;
                     self.drawn = Instant::now();
@@ -1667,6 +1709,13 @@ impl App {
                 }
             }
         }
+    }
+
+    /// What a full repaint keys on: the shown tab and shell, and how many tabs
+    /// and shells there are.
+    fn layout_key(&self) -> (usize, usize, usize, usize) {
+        let shell = self.tabs.get(self.active).map_or(0, |t| t.active);
+        (self.active, shell, self.tabs.len(), self.tabs.iter().map(|t| t.shells.len()).sum())
     }
 
     fn handle(&mut self, event: Event) -> Result<(), Box<dyn Error>> {
@@ -1773,10 +1822,10 @@ impl App {
         if self.tabs.is_empty() {
             return Ok(());
         }
-        // Every shortcut of ricon's own lives on Alt (kata app.md), so Ctrl
-        // keys reach the shell untouched — Ctrl+C is always SIGINT, never a
-        // copy (releasing the drag already copied). Esc is never shadowed
-        // either: with a selection live, both merely take the highlight down
+        // Every shortcut of ricon's own lives on Alt (kata app.md) bar Ctrl+f
+        // (search), so Ctrl keys reach the shell untouched — Ctrl+C is always
+        // SIGINT, never a copy (releasing the drag already copied). Esc is
+        // never shadowed either (outside the search row): with a selection live, both merely take the highlight down
         // on their way through.
         // Ctrl+Alt+letter is the app's (Emacs/readline C-M- bindings): only a
         // bare Alt chord is ricon's.
@@ -1793,9 +1842,9 @@ impl App {
             // nothing; it must never take every other tab down with it.
             KeyCode::Char('t' | 'T' | 'n' | 'N') if ours => self.open_tab().unwrap_or_default(),
             KeyCode::Char('w' | 'W') if ours => self.close_active(),
-            // Alt+f focuses the search row; the favorite toggle, which shared
-            // the letter, moved to Alt+Shift+f.
-            KeyCode::Char('f') if ours => self.search_focus = true,
+            // Ctrl+f focuses the search row — the one Ctrl chord ricon takes;
+            // Alt+f (readline forward-word) goes to the shell.
+            KeyCode::Char('f') if ctrl && !alt => self.search_focus = true,
             KeyCode::Char('F') if ours => self.toggle_favorite(),
             KeyCode::Char('s' | 'S') if ours => self.open_subshell().unwrap_or_default(),
             KeyCode::Char('r' | 'R') if ours => self.tabs[self.active].active_shell_mut().replay(),
@@ -1812,8 +1861,17 @@ impl App {
             KeyCode::PageDown if ours => self.navigate_tabs(1),
             KeyCode::PageUp if ours => self.navigate_tabs(-1),
             // Search row editing while it has focus: printable keys build the
-            // filter, Backspace erases, Esc/Enter hand focus back to the shell.
-            KeyCode::Esc | KeyCode::Enter if self.search_focus => self.search_focus = false,
+            // filter, Backspace erases, Enter keeps the filter and hands focus
+            // back to the shell. Esc cancels the search: the filter is cleared
+            // and the key is consumed — an agent must not read it as an
+            // interrupt the user never meant for it.
+            KeyCode::Enter if self.search_focus => self.search_focus = false,
+            KeyCode::Esc if self.search_focus => {
+                self.search_focus = false;
+                self.search.clear();
+                self.selection = None;
+                self.refresh_shown();
+            }
             KeyCode::Backspace if self.search_focus => {
                 self.search.pop();
                 self.refresh_shown();
@@ -1823,8 +1881,10 @@ impl App {
                 self.refresh_shown();
             }
             _ => {
-                if matches!(key.code, KeyCode::Esc) || (ctrl && matches!(key.code, KeyCode::Char('c'))) {
+                if matches!(key.code, KeyCode::Esc) {
                     self.selection = None; // the highlight goes; the key still goes through
+                } else if ctrl && matches!(key.code, KeyCode::Char('c')) {
+                    self.selection = None; // the highlight goes; Ctrl+C still goes through
                 }
                 let Some(tab) = self.tabs.get(self.active) else { return Ok(()) };
                 let modes = tab.active_shell().modes();
@@ -1865,7 +1925,12 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
-        let Some(tab) = self.tabs.get(self.active).filter(|_| self.confirm_quit.is_none()) else {
+        // The quit dialog and the cheat sheet are modal (kata app.md): a paste
+        // must not reach the shell while either is open, like a key or a click.
+        if self.confirm_quit.is_some() || self.help {
+            return Ok(());
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
             return Ok(());
         };
         let text = paste_text(text);
@@ -2077,10 +2142,6 @@ impl App {
         match (self.selection.as_mut(), mouse.kind) {
             (Some(sel), MouseEventKind::Drag(MouseButton::Left)) if let Some(head) = dragged => {
                 sel.head = head;
-                // Shift+Ctrl held through the drag makes it a block selection;
-                // the flag is read live so the user can switch mid-gesture.
-                sel.block = mouse.modifiers.contains(KeyModifiers::SHIFT)
-                    && mouse.modifiers.contains(KeyModifiers::CONTROL);
                 // A drag is not a click: it ends any double/triple-click chain,
                 // so pressing again where a drag started selects afresh instead
                 // of surprising the user with the word under the cursor.
@@ -2219,9 +2280,9 @@ impl App {
             // needs no modifier at all, and it is on by default; only the left
             // button (and the middle one, for paste) is taken — the wheel and
             // the rest still reach an app that asked for the mouse, so it
-            // keeps scrolling its own content. Shift+Ctrl+drag is a block
+            // keeps scrolling its own content. A drag is always a block
             // (rectangular) selection — the column of text a table or a log
-            // needs — and is owned by ricon too.
+            // needs.
             let ours = !grabbed || self.copy_mode || mouse.modifiers.intersects(BYPASS);
             // Wheel over the pane scrolls this shell's scrollback unless the
             // inner app subscribed to the mouse (then it is forwarded, so
@@ -2244,14 +2305,13 @@ impl App {
                     // gestures every terminal has, reconstructed from timing
                     // because hosts only ever report single presses.
                     MouseEventKind::Down(MouseButton::Left) => {
+                        self.search_focus = false; // typing goes where the user clicked
                         let cell = (mouse.row, mouse.column - self.sidebar_width);
                         let shell = (self.active, self.tabs[self.active].active);
                         match self.click_count(cell) {
                             2 => self.select_span(shell, self.word_at(cell)),
                             3 => self.select_span(shell, self.line_at(cell)),
                             _ => {
-                                let block = mouse.modifiers.contains(KeyModifiers::SHIFT)
-                                    && mouse.modifiers.contains(KeyModifiers::CONTROL);
                                 let pos = self.pos_at(cell);
                                 self.selection = Some(Selection {
                                     shell,
@@ -2259,7 +2319,7 @@ impl App {
                                     head: pos,
                                     shift: self.tabs[self.active].active_shell().content_shift(),
                                     dragging: true,
-                                    block,
+                                    block: true,
                                     text: None,
                                 });
                             }
@@ -2355,6 +2415,9 @@ impl App {
         let at = (self.active + 1).max(after_favorites).min(self.tabs.len());
         self.tabs.insert(at, tab);
         self.active = at;
+        // `shown` holds positions into `tabs`; keep it in step now, not only on
+        // the next tick — a whole burst of events is drained between two frames.
+        self.refresh_shown();
         Ok(())
     }
 
@@ -2383,6 +2446,9 @@ impl App {
         let dest = self.tabs.iter().take_while(|t| t.favorite).count();
         self.tabs.insert(dest, tab);
         self.active = dest;
+        // See `open_tab`: the filtered list is index-based, so it is rebuilt at
+        // once rather than left stale until the next frame.
+        self.refresh_shown();
     }
 
     /// Append a restored tab at the end (restore preserves saved order): spawn
@@ -2445,19 +2511,17 @@ impl App {
         }
     }
 
-    /// Close the active shell of the active tab; when it was the tab's last
-    /// shell, the tab itself closes on the next reap. Reap immediately so the
-    /// close is visible without waiting on the 10-Hz throttle.
+    /// Close the active shell of the active tab, and the tab with it when it
+    /// was the last one — at once, not on the next 10 Hz reap.
     fn close_active(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            let shell = tab.active_shell_mut();
-            // Seal the transcript first, as quitting does: an agent that
-            // clears its screen on the way out must not erase its last answer.
-            shell.finish_log();
-            let _ = shell.child.kill();
+            let shell = tab.shells.remove(tab.active);
+            // Dropping seals the transcript, then hangs the child up — both can
+            // block (an fsync, a shell ignoring SIGHUP), so never on this thread.
+            self.closing.retain(|h| !h.is_finished());
+            self.closing.push(thread::spawn(move || drop(shell)));
         }
-        self.reaped = stale(Duration::from_secs(1));
-        self.reap_dead_tabs();
+        self.reap_dead_tabs(); // a tab left without shells goes; indices are re-clamped
     }
 
     /// Sample /proc for a slice of shells this frame, rotating through all of
@@ -2683,6 +2747,20 @@ fn draw(frame: &mut Frame, app: &mut App) {
         let shell = tab.active_shell();
         let parser = shell.parser.lock().unwrap_or_else(PoisonError::into_inner);
         frame.render_widget(PseudoTerminal::new(parser.screen()), pane);
+        // vt100 lays an emoji + U+FE0F into ONE cell, but ratatui measures that
+        // symbol as two and skips writing the cell after it — whatever the host
+        // had there stayed on screen. Drop the selector so both agree on one.
+        let buf = frame.buffer_mut();
+        for y in pane.top()..pane.bottom() {
+            for x in pane.left()..pane.right() {
+                if let Some(cell) = buf.cell_mut((x, y))
+                    && cell.symbol().contains(VS16)
+                {
+                    let symbol = cell.symbol().replace(VS16, "");
+                    cell.set_symbol(&symbol);
+                }
+            }
+        }
         // Overlay the live selection in reading order. The cells are painted
         // outright rather than reversed: reversing cancels itself out over text
         // that is already inverse (prompts, status lines, a selected menu row),
@@ -2741,6 +2819,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// Variation selector 16 (emoji presentation) — see `draw`.
+const VS16: char = '\u{FE0F}';
+
 /// Every shortcut of ricon's own, for the cheat sheet (kata app.md).
 const SHORTCUTS: &[(&str, &str)] = &[
     ("Alt+t / Alt+n", "new tab"),
@@ -2749,12 +2830,12 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Alt+↑ / Alt+↓", "previous / next shell"),
     ("Alt+PgUp / PgDn", "previous / next tab"),
     ("Alt+1 … Alt+9", "tab by number"),
-    ("Alt+f", "search tabs"),
+    ("Ctrl+f", "search tabs (Esc clears)"),
     ("Alt+Shift+f", "favorite (pinned on top)"),
     ("Alt+r", "replay the last command"),
     ("Alt+c", "copy mode on / off"),
     ("Alt+a", "select the screen + copy"),
-    ("Alt+?", "this cheat sheet"),
+    ("Alt+? / Alt+h", "this cheat sheet"),
     ("Alt+q", "quit"),
     ("drag · 2× · 3× click", "select + copy"),
     ("middle click", "paste"),
@@ -2883,7 +2964,7 @@ fn status_bar(f: Footer) -> Line<'static> {
         .and_then(|a| a.context)
         .and_then(Context::fill)
         .is_some_and(|f| f >= CONTEXT_WARN_AT);
-    let mut spans = match left.find(&context).filter(|_| warn && !context.is_empty()) {
+    let mut spans = match left.rfind(&context).filter(|_| warn && !context.is_empty()) {
         Some(at) => vec![
             Span::raw(left[..at].to_string()),
             Span::styled(context.clone(), style.fg(CONTEXT_WARN_FG)),
@@ -3215,7 +3296,11 @@ impl Probe {
                     .cwd()?
                     .to_str()?
                     .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                    // Claude Code (JS) replaces per UTF-16 unit: an emoji is `--`.
+                    .flat_map(|c| {
+                        let (c, n) = if c.is_ascii_alphanumeric() { (c, 1) } else { ('-', c.len_utf16()) };
+                        std::iter::repeat_n(c, n)
+                    })
                     .collect();
                 let project = self.home.as_ref()?.join(dir).join(slug);
                 // A registered session is the only answer, even before its
@@ -3239,7 +3324,7 @@ impl Probe {
         let mut cached = self.tail.borrow_mut();
         TAILS.iter().find_map(|&max| {
             if cached.as_ref().is_none_or(|(read, _)| *read < max.min(len)) {
-                *cached = Some((max.min(len), tail_lines(path, max, len)?));
+                *cached = Some((max.min(len), tail_lines(path, max)?));
             }
             let (_, text) = cached.as_ref()?;
             // Past the whole file, a wider read would find nothing new: stop.
@@ -3336,12 +3421,15 @@ const WIDE_CONTEXT_WINDOW: u64 = 1_000_000;
 /// the line written after the answer being looked for.
 const TAILS: [u64; 3] = [64 * 1024, 1024 * 1024, 8 * 1024 * 1024];
 
-/// The whole lines in the last `max` bytes of `path`, a file `len` bytes long.
+/// The whole lines in the last `max` bytes of `path`.
 /// The line the window starts inside is dropped: it is not whole, and a cut
 /// line can lose the very marker (`isSidechain`) that disqualifies it.
-fn tail_lines(path: &Path, max: u64, len: u64) -> Option<String> {
-    let text = String::from_utf8_lossy(&read_tail(path, max)?).into_owned();
-    Some(if len > max {
+fn tail_lines(path: &Path, max: u64) -> Option<String> {
+    let bytes = read_tail(path, max)?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    // A full window started mid-file (the file may have grown since it was
+    // measured): its first line is a fragment.
+    Some(if bytes.len() as u64 >= max {
         text.split_once('\n').map_or_else(String::new, |(_, rest)| rest.to_string())
     } else {
         text
@@ -3422,7 +3510,9 @@ fn log_tail_value(dir: &str, key: &str) -> Option<String> {
 /// limit — so the entry is addressed by path, never searched for. It is a
 /// multi-MiB file, so the answer is kept until the file changes.
 fn opencode_context_limit(provider: &str, id: &str) -> Option<u64> {
-    type Cached = (SystemTime, String, Option<u64>);
+    // One entry per model, dropped whole when the catalog changes: two tabs
+    // on different models must not re-parse the multi-MiB file in turn.
+    type Cached = (SystemTime, HashMap<String, Option<u64>>);
     static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
     if provider.contains('"') || id.contains('"') {
         return None; // not addressable in a JSON path
@@ -3431,10 +3521,11 @@ fn opencode_context_limit(provider: &str, id: &str) -> Option<u64> {
     let modified = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok()?;
     let key = format!("$.\"{provider}\".models.\"{id}\".limit.context");
     let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some((at, cached, limit)) = cache.as_ref()
-        && *at == modified
-        && *cached == key
-    {
+    let (at, limits) = cache.get_or_insert_with(|| (modified, HashMap::new()));
+    if *at != modified {
+        (*at, *limits) = (modified, HashMap::new());
+    }
+    if let Some(limit) = limits.get(&key) {
         return *limit;
     }
     let catalog = std::fs::read_to_string(&path).ok()?;
@@ -3442,7 +3533,7 @@ fn opencode_context_limit(provider: &str, id: &str) -> Option<u64> {
         .and_then(|db| db.query_row("SELECT json_extract(?1, ?2)", [&catalog, &key], |row| row.get(0)))
         .ok()
         .flatten();
-    *cache = Some((modified, key, limit));
+    limits.insert(key, limit);
     limit
 }
 
@@ -4118,6 +4209,12 @@ fn ctrl_byte(c: char) -> u8 {
 /// Translate a key event into the byte sequence a terminal would send,
 /// honoring DECCKM (application cursor keys) and xterm modifier encoding.
 fn encode_key(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
+    // Super/Hyper/Meta only arrive under the kitty protocol, and a legacy
+    // terminal sends nothing for them: typing the bare key instead put stray
+    // letters into the prompt.
+    if key.modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META) {
+        return None;
+    }
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -4255,7 +4352,7 @@ fn selection_cells(a: (u16, u16), b: (u16, u16), cols: u16) -> impl Iterator<Ite
 
 /// The (row, col) cells of a block (rectangular) selection from `a` to `b`
 /// (inclusive) — every cell in the rectangle, row by row. This is what a
-/// Shift+Ctrl+drag highlights and copies.
+/// drag highlights and copies.
 fn block_cells(a: (u16, u16), b: (u16, u16)) -> impl Iterator<Item = (u16, u16)> {
     let (a, b) = corners(a, b);
     (a.0..=b.0).flat_map(move |r| (a.1..=b.1).map(move |c| (r, c)))
@@ -4327,11 +4424,15 @@ fn clipboard_thread() -> &'static ClipboardPost {
                         let _ = clipboard.set_text(&text);
                     }
                     Clip::Get(reply) => {
-                        let text = clipboard
-                            .get()
-                            .clipboard(LinuxClipboardKind::Primary)
-                            .text()
-                            .or_else(|_| clipboard.get_text());
+                        let text = clipboard.get().clipboard(LinuxClipboardKind::Primary).text().or_else(
+                            |e| match e {
+                                // No primary selection on this platform: the
+                                // clipboard stands in. An *empty* primary pastes
+                                // nothing — never the clipboard behind it.
+                                arboard::Error::ClipboardNotSupported => clipboard.get_text(),
+                                e => Err(e),
+                            },
+                        );
                         if let Ok(text) = text
                             && !text.is_empty()
                         {

@@ -161,6 +161,8 @@ fn test_app(shell_counts: &[usize]) -> App {
         quit: false,
         confirm_quit: None,
         help: false,
+        drawn_layout: (0, 0, 0, 0),
+        closing: Vec::new(),
     };
     app.refresh_shown();
     app
@@ -405,9 +407,9 @@ fn is_shell_matches_shells_including_login_and_paths() {
 }
 
 #[test]
-fn version_is_0_4_2() {
-    // Kata meta.md: ricon app version is 0.4.2.
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.2");
+fn version_is_0_4_3() {
+    // Kata meta.md: ricon app version is 0.4.3.
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.3");
 }
 
 // ── theming ──────────────────────────────────────────────────────────────────
@@ -1008,8 +1010,9 @@ fn ctrl_c_is_never_shadowed_and_takes_the_highlight_down() {
         "ctrl+c reaches the shell, got: {:?}",
         screen_contents(app.tabs[0].active_shell())
     );
-    // Esc does the same: never shadowed, takes a highlight down.
-    app.search_focus = false; // Esc on the search row only hands focus back
+    // Esc from the search row (focused at startup) cancels the search: it
+    // hands focus back and drops the highlight too.
+    app.search_focus = true;
     app.selection = Some(Selection {
         shell: (0, 0),
         anchor: (row as isize, col),
@@ -1020,6 +1023,7 @@ fn ctrl_c_is_never_shadowed_and_takes_the_highlight_down() {
         text: None,
     });
     app.on_key(key(KeyCode::Esc, KeyModifiers::NONE)).expect("esc");
+    assert!(!app.search_focus, "esc leaves the search row");
     assert!(app.selection.is_none(), "esc drops the selection");
 }
 
@@ -1168,8 +1172,8 @@ fn bypass_drag_copies_over_a_mouse_grabbing_app() {
 }
 
 #[test]
-fn shift_ctrl_drag_makes_a_block_selection_and_copies_the_rectangle() {
-    // Kata ui.md: Shift+Ctrl+drag is a block (rectangular) selection — the way
+fn drag_makes_a_block_selection_and_copies_the_rectangle() {
+    // Kata ui.md: a drag is a block (rectangular) selection — the way
     // to lift a column of text out of a table or a log. Each row's columns are
     // joined by a newline, so the clipboard holds exactly the rectangle that
     // was highlighted, and the highlight is the rectangle, not whole rows.
@@ -1196,8 +1200,8 @@ fn shift_ctrl_drag_makes_a_block_selection_and_copies_the_rectangle() {
     let (row, row2) = (rows[rows.len() - 2], rows[rows.len() - 1]);
     let col = contents.lines().nth(row as usize).unwrap().find(tok).unwrap() as u16;
     let sw = app.sidebar_width;
-    let mods = KeyModifiers::SHIFT.union(KeyModifiers::CONTROL);
-    let ev = |kind, c: u16, r: u16| MouseEvent { kind, column: sw + c, row: r, modifiers: mods };
+    let ev =
+        |kind, c: u16, r: u16| MouseEvent { kind, column: sw + c, row: r, modifiers: KeyModifiers::NONE };
     // Drag from the token's start on the first line to its end on the second.
     let end = col + tok.len() as u16 - 1;
     app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), col, row)).expect("press");
@@ -1205,7 +1209,7 @@ fn shift_ctrl_drag_makes_a_block_selection_and_copies_the_rectangle() {
     app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), end, row2)).expect("release");
 
     let sel = app.selection.as_ref().expect("block selection survives release");
-    assert!(sel.block, "Shift+Ctrl marks the selection as a block");
+    assert!(sel.block, "a drag is a block");
     assert!(!sel.dragging, "release ends the drag");
     let text = app.selection_text(sel.clone()).expect("block text");
     // The rectangle is the token's columns on each row, joined by a newline —
@@ -1441,12 +1445,12 @@ fn scrolling_carries_the_selection_with_the_text() {
             break;
         }
     }
-    let (row, col) = screen_contents(app.tabs[0].active_shell())
+    // A drag is a block, so start at column 0 to take the whole width.
+    let row = screen_contents(app.tabs[0].active_shell())
         .lines()
-        .enumerate()
-        .find_map(|(r, line)| line.find(tok).map(|c| (r as u16, c as u16)))
-        .expect("token in view");
-    app.on_mouse(press(MouseEventKind::Down(MouseButton::Left), sw + col, row)).expect("press on the token");
+        .position(|line| line.contains(tok))
+        .expect("token in view") as u16;
+    app.on_mouse(press(MouseEventKind::Down(MouseButton::Left), sw, row)).expect("press on the token's row");
     // Scroll back to the live screen mid-drag and release on its last line.
     for _ in 0..200 {
         app.on_mouse(wheel(MouseEventKind::ScrollDown)).expect("wheel down");
@@ -1456,7 +1460,10 @@ fn scrolling_carries_the_selection_with_the_text() {
     app.on_mouse(press(MouseEventKind::Drag(MouseButton::Left), sw + app.pty_cols - 1, last)).expect("drag");
     app.on_mouse(press(MouseEventKind::Up(MouseButton::Left), sw + app.pty_cols - 1, last)).expect("release");
     let text = app.selection.as_ref().and_then(|sel| sel.text.clone()).expect("copied");
-    assert!(text.starts_with(tok), "starts at the token, screens above: {text:?}");
+    assert!(
+        text.lines().next().is_some_and(|l| l.contains(tok)),
+        "starts at the token, screens above: {text:?}"
+    );
     assert!(
         text.lines().any(|l| l.trim() == "1") && text.lines().any(|l| l.trim() == "200"),
         "and runs through all of it"
@@ -2132,10 +2139,10 @@ fn alt_shortcuts_open_and_close_tabs_focus_search_and_mark_favorites() {
     app.on_key(key(KeyCode::Char('F'), KeyModifiers::ALT | KeyModifiers::SHIFT)).expect("alt+shift+f");
     assert!(app.tabs[0].favorite, "alt+shift+f marks the favorite");
     assert!(!app.search_focus, "and does not touch the search row");
-    app.on_key(key(KeyCode::Char('f'), KeyModifiers::ALT)).expect("alt+f");
-    assert!(app.search_focus, "alt+f focuses the search row");
-    app.on_key(key(KeyCode::Char('f'), KeyModifiers::ALT)).expect("alt+f again");
-    assert!(app.tabs[0].favorite, "alt+f never toggles the favorite");
+    app.on_key(key(KeyCode::Char('f'), KeyModifiers::CONTROL)).expect("ctrl+f");
+    assert!(app.search_focus, "ctrl+f focuses the search row");
+    app.on_key(key(KeyCode::Char('f'), KeyModifiers::CONTROL)).expect("ctrl+f again");
+    assert!(app.tabs[0].favorite, "ctrl+f never toggles the favorite");
     // Ctrl+t reaches the shell now (bash swaps the two characters before the cursor).
     app.search_focus = false;
     let shell = app.tabs[0].active_shell();
@@ -3445,8 +3452,9 @@ fn search_starts_focused_and_filters_tabs() {
     assert!(row_text(&buf, 1, W).contains("⌕ bet█"), "typed filter with caret");
     assert!(row_text(&buf, 2, W).contains("beta"), "first shown tab is the match");
     assert_eq!(app.tab_at_row(2), Some(1), "hit-testing follows the filter");
-    // Esc returns focus to the shell; typing no longer edits the filter.
-    app.on_key(key(KeyCode::Esc, KeyModifiers::NONE)).expect("esc");
+    // Enter keeps the filter and returns focus to the shell; typing no longer
+    // edits the filter.
+    app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)).expect("enter");
     assert!(!app.search_focus);
     app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE)).expect("shell key");
     assert_eq!(app.search, "bet", "unfocused typing goes to the shell");
@@ -3457,12 +3465,14 @@ fn search_starts_focused_and_filters_tabs() {
 }
 
 #[test]
-fn search_focus_via_alt_f_mouse_and_tab_click() {
+fn search_focus_via_ctrl_f_mouse_and_tab_click() {
     // Kata: search row selectable by Ctrl+F and by mouse.
     let mut app = test_app(&[1, 1]);
     app.search_focus = false;
     app.on_key(key(KeyCode::Char('f'), KeyModifiers::ALT)).expect("alt+f");
-    assert!(app.search_focus, "Alt+f focuses the search row");
+    assert!(!app.search_focus, "Alt+f is the shell's (forward-word)");
+    app.on_key(key(KeyCode::Char('f'), KeyModifiers::CONTROL)).expect("ctrl+f");
+    assert!(app.search_focus, "Ctrl+f focuses the search row");
     app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)).expect("enter");
     assert!(!app.search_focus, "Enter hands focus back");
     let down = |row| MouseEvent {
@@ -3475,6 +3485,37 @@ fn search_focus_via_alt_f_mouse_and_tab_click() {
     assert!(app.search_focus, "mouse click focuses the search row");
     app.on_mouse(down(2)).expect("click a tab");
     assert!(!app.search_focus, "selecting a tab unfocuses the search");
+    app.search_focus = true;
+    app.on_mouse(MouseEvent { column: SIDEBAR_WIDTH + 5, ..down(5) }).expect("click the pane");
+    assert!(!app.search_focus, "clicking the pane hands typing back to the shell");
+}
+
+#[test]
+fn esc_cancels_the_search_and_is_consumed() {
+    // Esc in the search row clears the filter and leaves; it never reaches the
+    // shell, where an agent would take it as an interrupt.
+    let mut app = test_app(&[1, 1]);
+    app.tabs[0].shells[0].cwd = Some("/tmp/alpha".into());
+    app.tabs[1].shells[0].cwd = Some("/tmp/beta".into());
+    for c in "beta".chars() {
+        app.on_key(key(KeyCode::Char(c), KeyModifiers::NONE)).expect("type");
+    }
+    assert_eq!(app.shown, vec![1]);
+    app.on_key(key(KeyCode::Esc, KeyModifiers::NONE)).expect("esc");
+    assert!(!app.search_focus, "esc leaves the search row");
+    assert!(app.search.is_empty(), "esc clears the filter");
+    assert_eq!(app.shown, vec![0, 1], "every tab is back");
+    assert!(
+        app.tabs[0].active_shell().last_input.elapsed() > Duration::from_secs(60),
+        "esc never reached the shell"
+    );
+}
+
+#[test]
+fn super_hyper_meta_keys_type_nothing() {
+    for m in [KeyModifiers::SUPER, KeyModifiers::HYPER, KeyModifiers::META] {
+        assert_eq!(encode_key(&key(KeyCode::Char('v'), m), false), None, "{m:?}+v");
+    }
 }
 
 #[test]
@@ -4230,6 +4271,22 @@ fn closing_the_cheat_sheet_swallows_the_rest_of_its_click() {
 }
 
 #[test]
+fn a_paste_while_the_cheat_sheet_is_open_reaches_nothing() {
+    // Kata app.md: the cheat sheet is modal — a paste is input as much as a key
+    // is, so while it is up nothing may leak to the shell underneath.
+    let mut app = test_app(&[1]);
+    let shell = app.tabs[0].active_shell();
+    assert!(wait_for(|| shell.activity.load(Ordering::Relaxed) > 0, Duration::from_secs(10)), "prompt");
+    thread::sleep(Duration::from_millis(200)); // let the prompt land whole
+    let before = screen_contents(app.tabs[0].active_shell());
+    app.help = true;
+    app.handle(Event::Paste("echo RICON_PASTE_LEAK\r".into())).expect("paste");
+    thread::sleep(Duration::from_millis(150));
+    assert!(app.help, "the paste does not close the sheet like a key");
+    assert_eq!(screen_contents(app.tabs[0].active_shell()), before, "the paste never reached the shell");
+}
+
+#[test]
 fn transcript_keeps_a_repeated_block_that_matches_its_anchor() {
     // The reader thread counts the lines each chunk pushes, so output that
     // repeats the last committed rows exactly is still new output.
@@ -4369,4 +4426,58 @@ fn a_selection_stays_on_its_text_when_output_scrolls_under_a_scrolled_back_view(
     let mut sel = app.selection.clone().expect("selection");
     sel.text = None; // read the live text at its (carried) position
     assert_eq!(app.selection_text(sel).as_deref(), Some(tok), "still the token");
+}
+
+#[test]
+fn transcript_survives_the_pane_narrowing() {
+    // vt100 never reflows scrollback: rows pushed before a narrowing are wider
+    // than the screen. Read cut, their digests stopped matching the anchor and
+    // the whole buffer was written again.
+    let dir = std::env::temp_dir().join(format!("ricon-narrow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let text = with_transcripts(&dir, || {
+        let parser = test_parser(5, 40, 5000);
+        let log = Transcript::new(5000);
+        for i in 0..30 {
+            feed(&parser, &log, &format!("pre{i}\r\n"));
+        }
+        log.arm(test_meta()).expect("armed");
+        for i in 0..40 {
+            feed(&parser, &log, &format!("L{i:02}{}\r\n", "-".repeat(35)));
+        }
+        parser.lock().unwrap_or_else(PoisonError::into_inner).screen_mut().set_size(5, 30);
+        feed(&parser, &log, "after\r\n");
+        log.close(&parser);
+        only_transcript(&dir)
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(text.matches("L00").count(), 1, "written once: {text}");
+    assert!(text.contains(&format!("L00{}", "-".repeat(35))), "whole, not cut to the new width");
+}
+
+#[test]
+fn emoji_presentation_selector_never_widens_a_pane_cell() {
+    // vt100 keeps "⚠️" in one cell; ratatui measured it as two and never wrote
+    // the cell after it, so the host kept whatever was there before.
+    let mut app = test_app(&[1]);
+    app.tabs[0].shells[0]
+        .parser
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .process("\x1b[18;1Ha\u{26a0}\u{fe0f}b".as_bytes());
+    let buf = render(&mut app, W, H);
+    let x = app.sidebar_width;
+    assert_eq!(buf[(x + 1, 17)].symbol(), "\u{26a0}");
+    assert_eq!(buf[(x + 2, 17)].symbol(), "b");
+}
+
+#[test]
+fn closing_a_shell_removes_it_at_once() {
+    let mut app = test_app(&[2, 1]);
+    app.tabs[0].active = 1;
+    app.close_active();
+    assert_eq!(app.tabs[0].shells.len(), 1, "the subshell is gone without waiting on a reap");
+    app.close_active();
+    assert_eq!(app.tabs.len(), 1, "the tab went with its last shell");
+    assert_eq!(app.active, 0);
 }
