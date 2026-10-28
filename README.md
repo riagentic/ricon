@@ -1,20 +1,10 @@
 # ricon
 
+[![CI](https://github.com/riagentic/ricon/actions/workflows/ci.yml/badge.svg)](https://github.com/riagentic/ricon/actions/workflows/ci.yml)
+
 A fast terminal console with **vertical tabs** — built with [ratatui](https://ratatui.rs) + [portable-pty](https://crates.io/crates/portable-pty). Each tab holds one or more real shells; the sidebar shows folder, path, running process, git branch and live activity. ricon lives inside your existing terminal and aims to be the best console with vertical tabs.
 
-```
-┌ ricon ──┐
-│▶1 ricon │   $ cargo build --release
-│   ~/code/gen/ricon
-│   └ cargo ⠹
-│  ▶~/code/gen/ricon/src
-│   └ vim
-│──━━━━━━──│
-│ 2 ⭐web *│
-│   ~/code/web
-│   └ vite │
-└──────────┘ 1/2 ▸ ~/code/gen/ricon  ⎇ main  ✳ claude-opus-5 93k/1M  ⧉ copy ✓ v0.4.3
-```
+![ricon: a favorite tab running a dev server, and a tab with two shells — one building ricon itself](docs/screenshot.png)
 
 ## Features
 
@@ -52,6 +42,8 @@ cd ricon
 cargo build --release
 ./target/release/ricon
 ```
+
+**Tests:** 184 (`cargo test`). CI runs them on Linux for every push to main and every PR, with `cargo fmt --check` and `cargo clippy -D warnings`. Linux only (see Platform below).
 
 ## Usage
 
