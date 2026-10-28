@@ -477,12 +477,20 @@ impl Transcript {
             (risen >= probe && risen < after).then(|| risen - probe)
         };
         screen.set_scrollback(if view == 0 { 0 } else { risen });
-        let _ = self.pushed.fetch_update(Ordering::AcqRel, Ordering::Acquire, |pushed| {
-            Some(match count {
+        // A plain CAS loop rather than `fetch_update`: that method is deprecated
+        // on current stable (renamed `try_update`), and `try_update` is newer
+        // than this crate's `rust-version`. Same semantics on both.
+        let mut pushed = self.pushed.load(Ordering::Acquire);
+        loop {
+            let next = match count {
                 Some(count) if pushed != UNCOUNTED => pushed.saturating_add(count).min(UNCOUNTED - 1),
                 _ => UNCOUNTED,
-            })
-        });
+            };
+            match self.pushed.compare_exchange_weak(pushed, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(actual) => pushed = actual,
+            }
+        }
     }
 
     /// The pushed-line count since the last pass, reset for the next. Taken
